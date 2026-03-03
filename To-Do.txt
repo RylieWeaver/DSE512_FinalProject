@@ -1,0 +1,29 @@
+### Main To-Do's: ###
+
+
+# Required
+(1) Get real genotype data (https://phytozome-next.jgi.doe.gov/info/Ptrichocarpa_v3_1)
+    - Load with FASTA (pyfastx)
+    - Create a DNA Tokenizer
+    - Create a PyTorch dataloader
+    - Make examples
+(2) Adjust things to account for padding, including:
+    - The Dataloader/tokenizer.
+    - The loss function so that it doesn't return NaN for all pads. All pads can happen
+    in a local subsequence (during sequence parallelism) even if the global sequence is
+    not all pads. You should be able to check if all labels equal "ignore_index".
+(3) Run Loss/Accuracy MLM experiments over multiple parameter sizes and context lengths
+    - These can be developed with only 2 GPUs (data parallel=1 and sequence parallel=2 
+    or vice versa), but then must be run with at least 4 to get meaningful size.
+
+
+# Nice to Have
+(1) A biological dataset for a downstream task that we could apply the models to.
+
+
+# Optional
+(1) Fully Sharded Data Parallel (FSDP) instead of simple Data Parallel
+    - This will allow us to distribute the memory cost of model parameters/optimizer
+(2) Make the model bidirectional rather than causal (will need to change the model and
+    how it handles padding if so). This might be good because DNA has bidirectional,
+    although isn't core to the project and requires some work.
