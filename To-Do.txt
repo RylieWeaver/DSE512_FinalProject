@@ -2,17 +2,18 @@
 
 
 # Required
-(1) Get real genotype data (https://phytozome-next.jgi.doe.gov/info/Ptrichocarpa_v3_1)
+(1) Make running examples on ISAAC (both salloc/direct run as well as SLURM script)
+(2) Get real genotype data (https://phytozome-next.jgi.doe.gov/info/Ptrichocarpa_v3_1)
     - Load with FASTA (pyfastx)
     - Create a DNA Tokenizer
     - Create a PyTorch dataloader
     - Make examples
-(2) Adjust things to account for padding, including:
+(3) Adjust things to account for padding, including:
     - The Dataloader/tokenizer.
     - The loss function so that it doesn't return NaN for all pads. All pads can happen
     in a local subsequence (during sequence parallelism) even if the global sequence is
     not all pads. You should be able to check if all labels equal "ignore_index".
-(3) Run Loss/Accuracy MLM experiments over multiple parameter sizes and context lengths
+(4) Run Loss/Accuracy MLM experiments over multiple parameter sizes and context lengths
     - These can be developed with only 2 GPUs (data parallel=1 and sequence parallel=2 
     or vice versa), but then must be run with at least 4 to get meaningful size.
 
