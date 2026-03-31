@@ -96,11 +96,11 @@ def init_parallel_state(
         os.environ["WORLD_SIZE"] = str(os.environ["SLURM_NTASKS"])
         os.environ["RANK"] = str(os.environ["SLURM_PROCID"])
 
-    # Early return for non-distributed
+    # Warn if env variables not set or not actally distributed (world_size=1)
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return ParallelState()
+        warnings.warn("RANK and WORLD_SIZE environment variables are not set. This will likely error.")
     if dp_size == 1 and sp_size == 1:
-        return ParallelState()
+        warnings.warn("dp_size and sp_size are both 1, so computation is not actually distributed.")
     
     # Configure world
     world_size = int(os.environ["WORLD_SIZE"])
