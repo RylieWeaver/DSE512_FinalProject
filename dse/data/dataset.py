@@ -28,17 +28,63 @@ def create_random_dna_string(path, n_bases=1_000_000, seed=42):
     return seq
 
 
+def bert_mlm_mask(input_ids, mask_token_id, dna_token_ids):
+    """
+    Apply standard BERT MLM corruption to a DNA token tensor.
+
+    Hard-coded probabilities:
+    - 15% of maskable tokens are selected for prediction
+    - of selected tokens: 80% -> [MASK], 10% -> random DNA base, 10% -> keep
+    """
+    # Setup
+    input_ids = input_ids.clone()
+    labels = torch.full_like(input_ids, -100)
+    dna_token_ids = torch.as_tensor(dna_token_ids, dtype=input_ids.dtype, device=input_ids.device)
+    maskable = torch.isin(input_ids, dna_token_ids)
+    if not maskable.any():
+        return input_ids, labels
+
+    # Select MLM positions and ensure at least one supervised token
+    selected = (torch.rand(input_ids.shape, device=input_ids.device) < 0.15) & maskable
+    if not selected.any():
+        flat_selected = selected.reshape(-1)
+        flat_maskable = maskable.reshape(-1)
+        maskable_idx = torch.nonzero(flat_maskable, as_tuple=False).flatten()
+        forced_idx = maskable_idx[torch.randint(maskable_idx.numel(), (1,), device=input_ids.device)]
+        flat_selected[forced_idx] = True
+        selected = flat_selected.view_as(selected)
+
+    # Supervise selected original tokens
+    labels[selected] = input_ids[selected]
+
+    # 80% [MASK], 10% random DNA base, 10% unchanged
+    corruption = torch.rand(input_ids.shape, device=input_ids.device)
+    to_mask = selected & (corruption < 0.8)
+    to_rand = selected & (corruption >= 0.8) & (corruption < 0.9)
+
+    input_ids[to_mask] = mask_token_id
+    if to_rand.any():
+        rand_choices = dna_token_ids[
+            torch.randint(dna_token_ids.numel(), input_ids.shape, device=input_ids.device)
+        ]
+        input_ids[to_rand] = rand_choices[to_rand]
+    return input_ids, labels
+
+
 class DNADataset(IterableDataset):
     def __init__(self, path, chunk_size=8192, seed=42, parallel_state=None):
         with open(path, "r", encoding="utf-8") as handle:
             self.dna_string = handle.read().strip().upper()
-        self.dna_vocab = {"A": 0, "C": 1, "G": 2, "T": 3}
+        self.dna_vocab = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4, "[MASK]": 5}
+        self.dna_token_ids = tuple(self.dna_vocab[bp] for bp in ("A", "C", "G", "T"))
+        self.mask_token_id = self.dna_vocab["[MASK]"]
+        self.vocab_size = len(self.dna_vocab)
         self.chunk_size = chunk_size
         self.seed = seed
         self.parallel_state = parallel_state if parallel_state else ParallelState()
     
     def _encode(self, sequence):
-        return [self.dna_vocab.get(ch) for ch in sequence]
+        return [self.dna_vocab.get(ch, self.dna_vocab["N"]) for ch in sequence]
 
     def __iter__(self):
         """
@@ -58,7 +104,14 @@ class DNADataset(IterableDataset):
                     raise ValueError(f"Chunk size {self.chunk_size} must be smaller than dataset sequence length {len(self.dna_string)}")
                 start_idx = rng.randint(0, len(self.dna_string) - self.chunk_size)
                 chunk = self.dna_string[start_idx : start_idx + self.chunk_size]
-                chunk = self._encode(chunk)  # Str -> List[int]
-                yield torch.tensor(chunk, dtype=torch.long)
+                chunk = torch.tensor(self._encode(chunk), dtype=torch.long)  # Str -> Tensor[int]
+                token_ids, labels = bert_mlm_mask(
+                    chunk,
+                    mask_token_id=self.mask_token_id,
+                    dna_token_ids=self.dna_token_ids,
+                )
+                yield token_ids, labels
             else:
-                yield torch.empty(self.chunk_size, dtype=torch.long)
+                token_ids = torch.empty(self.chunk_size, dtype=torch.long)
+                labels = torch.full((self.chunk_size,), -100, dtype=torch.long)
+                yield token_ids, labels

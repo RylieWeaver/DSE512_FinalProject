@@ -32,6 +32,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_dim", type=int, default=1024, help="Model dimension")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of linear warmup steps")
     parser.add_argument("--resume_from", type=str, default=None, help="Directory to resume training from checkpoint")
     args = parser.parse_args()
     base_dir = Path(args.base_dir).resolve()
@@ -39,6 +40,7 @@ if __name__ == "__main__":
     model_dim = args.model_dim
     steps = args.steps
     learning_rate = args.learning_rate
+    warmup_steps = args.warmup_steps
     resume_from = args.resume_from
     set_all_random_seeds(42)
 
@@ -56,17 +58,20 @@ if __name__ == "__main__":
     create_random_dna_string(data_path, n_bases=int(1.01 * context_len), seed=42)
     # NOTE: Dataset can be inspected with print(DNADataset.dna_string)
     dataset = DNADataset(path=data_path, chunk_size=context_len, seed=42)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=1)
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=1)
+    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1)  # Using the same dataset for validation for simplicity
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1)  # Using the same dataset for testing for simplicity
 
     # Train from scratch if no resume step is provided
     if not resume_from:
         ## Define the model
         model_cfg = DNATransformerConfig(
-            vocab_size=4,  # DNA has nucleotides: [A, C, G, T]
+            vocab_size=dataset.vocab_size,  # DNA vocab includes A/C/G/T plus N and [MASK]
             max_seq_len=context_len,
             dim=model_dim,
             num_heads=8,
             num_layers=6,
+            use_flash_attn=True,
         )
         model = DNATransformer(model_cfg).to(device)
         ## Trainer configuration
@@ -76,16 +81,21 @@ if __name__ == "__main__":
             eval_batches=10,
             batches_per_step=1,
             learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
             checkpoint_dir=f"{base_dir}/checkpoints",
             save_every=1000,
+            amp_dtype="bfloat16",
+            amp_enabled=True
         )
         trainer = Trainer(config=trainer_cfg, model=model, device=device)
+        trainer._init_optimizer()
     # Otherwise, train from checkpoint
     else:
         ckpt_dir = f"{base_dir}/checkpoints/{resume_from}"
         trainer = Trainer.load_checkpoint(ckpt_dir, device)
+        if context_len > trainer.model.cfg.max_seq_len:
+            trainer.model._update_context_len(new_context_len=context_len)
 
     # Train the model
-    trainer.set_loader(loader)
-    trainer._init_optimizer()
+    trainer.set_loaders(train_loader, val_loader, test_loader)
     trainer.train(steps=steps)

@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
 from dse.model import DNATransformerConfig, DNATransformer
+from dse.data import bert_mlm_mask
 from dse.distributed import init_parallel_state, rank0_print, check_param_sync, resolve_device
 from dse.utils import set_all_random_seeds
 
@@ -50,7 +51,7 @@ if __name__ == "__main__":
     print(message)
 
     # Init model/optimizer
-    vocab_size = V = 4  # DNA has 4 nucleotides: [A, C, G, T]
+    vocab_size = V = 6  # len([A, C, G, T, N, MASK]) = 6
     model_cfg = DNATransformerConfig(
         vocab_size=vocab_size,
         max_seq_len=10,
@@ -74,18 +75,24 @@ if __name__ == "__main__":
     input_ids = torch.randint(
         0, V, (B, S), dtype=torch.long, device=device           # [B, S]
     )
+    input_ids, labels = bert_mlm_mask(
+        input_ids,
+        mask_token_id=V-1,  # Mask token ID is set to vocab size (i.e. 4) since our vocab is [0, 1, 2, 3]
+        dna_token_ids=torch.tensor([0, 1, 2, 3, 4], device=device),
+    )                       # [B, S], [B, S]
     # Minibatch splitting
     b = (B // parallel_state.dp_size) if B % parallel_state.dp_size == 0 else (B // parallel_state.dp_size + 1)
     mb_start_idx = b * parallel_state.dp_rank
     mb_end_idx = min(mb_start_idx + b, B)
     mb_input_ids = input_ids.clone()[mb_start_idx:mb_end_idx]   # [B/DP, S] = [b, S]
+    mb_labels = labels.clone()[mb_start_idx:mb_end_idx]         # [B/DP, S] = [b, S]
     # NOTE: We don't split into subsequences for sequence
     # parallelism here (done within the model itself)
 
     # Do one forward/backward pass on non-distributed model
     model.train()
     opt.zero_grad()
-    logits, labels = model(input_ids)                           # [B, S-1, V]
+    logits, labels = model(input_ids, labels)                   # [B, S-1, V]
     logits = logits.reshape(-1, V)                              # [B*S-1, V]
     labels = labels.reshape(-1)                                 # [B*S-1]
     loss_fn = nn.CrossEntropyLoss()
@@ -95,9 +102,9 @@ if __name__ == "__main__":
     # Do one forward/backward pass on distributed model
     dist_model.train()
     dist_opt.zero_grad()
-    dist_logits, dist_labels = dist_model(mb_input_ids)         # [b, s, V] or [b, s-1, V] (s = subsequence length)
-    dist_logits = dist_logits.reshape(-1, V)                    # [b*s-1, V]
-    dist_labels = dist_labels.reshape(-1)                       # [b*s-1]
+    dist_logits, dist_labels = dist_model(mb_input_ids, mb_labels)      # [b, s, V] or [b, s-1, V] (s = subsequence length)
+    dist_logits = dist_logits.reshape(-1, V)                            # [b*s-1, V]
+    dist_labels = dist_labels.reshape(-1)                               # [b*s-1]
     dist_loss_fn = nn.CrossEntropyLoss()
     # Minibatch subsequence loss
     """
