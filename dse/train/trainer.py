@@ -265,7 +265,7 @@ class MLMTrainer:
                 self._inc_metrics(loss, correct, count, self.descriptors[0])
                 # Properly scale the loss for grad calculation to account for parallelism and accumulation
                 grad_loss = self.true_local_loss(loss, count) / self.cfg.batches_per_step
-                if batch_idx < self.cfg.batches_per_step - 1 and isinstance(unwrap_model(self.model), DDP):
+                if batch_idx < self.cfg.batches_per_step - 1 and isinstance(self.model, DDP):
                     with self.model.no_sync():
                         grad_loss.backward()
                 else:

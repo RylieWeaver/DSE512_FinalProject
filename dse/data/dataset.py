@@ -14,8 +14,9 @@ from .tokenizer import BPTokenizer
 
 
 
-def bert_mlm_mask(input_ids, tokenizer, prob=0.15, mask_prob=0.0, rand_prob=0.0, keep_prob=0.0):
+def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob=0.0, keep_prob=0.0):
     # Setup
+    tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
     device = input_ids.device
     maskable_ints = torch.tensor(                                               # only mask [A,T,C,G]
         [tokenizer.tok2id[bp] for bp in tokenizer.target_bp], device=device
@@ -199,7 +200,7 @@ class MLMCollator:
             torch.distributed.all_reduce(max_L_tensor, op=torch.distributed.ReduceOp.MAX, group=self.parallel_state.sp_group)
             max_L = max_L_tensor.item()
         min_pad_length = max(self.min_pad_length, max_L)
-        if is_rank0(self.parallel_state.sp_group):
+        if self.parallel_state.sp_size == 1 or is_rank0(self.parallel_state.sp_group):
             input_ids, labels = mlm_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length)
         else:
             input_ids = torch.empty((len(batch), min_pad_length), dtype=torch.long)

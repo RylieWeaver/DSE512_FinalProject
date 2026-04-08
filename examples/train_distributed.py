@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.set_loaders(train_loader, val_loader, test_loader)
-    trainer.model = DDP(trainer.model, process_group=parallel_state.world_group, device_ids=[device])
+    trainer.model = DDP(trainer.model, process_group=parallel_state.world_group, device_ids=[parallel_state.local_rank])
     trainer.train(steps=steps)
 
     # Cleanup

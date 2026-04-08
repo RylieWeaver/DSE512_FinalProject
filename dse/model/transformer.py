@@ -304,7 +304,7 @@ class Transformer(nn.Module):
     def no_wd_params(self):
         # Specify parameters that should not receive weight decay
         # (this is model specific and depends on variable names)
-        explicit = {"token_emb.embedding.weight"}
+        explicit = {"backbone.token_emb.embedding.weight"}
         exist = ("norm", "gamma", "beta")
         affix = (".bias")
 

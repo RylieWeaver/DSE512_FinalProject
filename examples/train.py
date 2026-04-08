@@ -57,7 +57,7 @@ if __name__ == "__main__":
     """
     create_random_dna_string(data_path, n_bases=int(1.01 * context_len), seed=42)
     # NOTE: Dataset can be inspected with print(DNADataset.dna_string)
-    dataset = DNADataset(path=data_path, chunk_size=context_len, seed=42)
+    dataset = DNADataset(path=data_path, chunk_size=context_len, base_seed=42)
     collator = MLMCollator(min_pad_length=context_len)
     train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
     val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)  # Using the same dataset for validation for simplicity

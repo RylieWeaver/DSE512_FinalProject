@@ -9,7 +9,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
 from dse.model import TransformerConfig, MLMTransformer
-from dse.data import bert_mlm_mask
+from dse.data import BPTokenizer, bert_mlm_mask
 from dse.distributed import init_parallel_state, rank0_print, check_param_sync, resolve_device
 from dse.utils import set_all_random_seeds
 
@@ -72,13 +72,10 @@ if __name__ == "__main__":
     B = 8
     S = 8
     input_ids = torch.randint(
-        0, V, (B, S), dtype=torch.long, device=device           # [B, S]
+        0, V, (B, S), dtype=torch.long, device=device                       # [B, S]
     )
-    input_ids, labels = bert_mlm_mask(
-        input_ids,
-        mask_token_id=V-1,  # Mask token ID is set to vocab size (i.e. 4) since our vocab is [0, 1, 2, 3]
-        dna_token_ids=torch.tensor([0, 1, 2, 3, 4], device=device),
-    )                       # [B, S], [B, S]
+    tokenizer = BPTokenizer()
+    input_ids, labels = bert_mlm_mask(input_ids, tokenizer=tokenizer)       # [B, S], [B, S]
     # Minibatch splitting
     b = (B // parallel_state.dp_size) if B % parallel_state.dp_size == 0 else (B // parallel_state.dp_size + 1)
     mb_start_idx = b * parallel_state.dp_rank
