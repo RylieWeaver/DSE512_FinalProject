@@ -1,1 +1,1 @@
-from .trainer import TrainerConfig, Trainer
+from .trainer import TrainerConfig, MLMTrainer

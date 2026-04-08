@@ -3,8 +3,6 @@ import math
 
 # Torch
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.autograd import Function
 
@@ -45,3 +43,19 @@ class _F_Gather_B_ReduceScatter(Function):
             grad_shard, grad_chunks, op=dist.ReduceOp.SUM, group=ctx.group  # [B, S // sp_size, D]
         )
         return grad_shard, None, None
+
+
+class _F_Mean_B_ReduceScatter(Function):
+    @staticmethod
+    def forward(ctx, x_shard, group, dim: int = 1):
+        ctx.group = group
+        ctx.world = dist.get_world_size(group=group)
+        x_mean = x_shard.contiguous()
+        dist.all_reduce(x_mean, op=dist.ReduceOp.SUM, group=group)
+        return x_mean / ctx.world
+
+    @staticmethod
+    def backward(ctx, grad_mean):
+        grad_shard = grad_mean.contiguous()
+        dist.all_reduce(grad_shard, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad_shard / ctx.world, None, None
