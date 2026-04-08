@@ -15,6 +15,9 @@ from .tokenizer import BPTokenizer
 
 
 def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob=0.0, keep_prob=0.0):
+    """
+    A lot of logic here is made to make sure we don't mask/predict 'N' tokens since they aren't informative.
+    """
     # Setup
     tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
     device = input_ids.device
@@ -22,7 +25,7 @@ def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob
         [tokenizer.tok2id[bp] for bp in tokenizer.target_bp], device=device
     )
     mask_int = tokenizer.tok2id[tokenizer.MASK]
-    labels = torch.full_like(input_ids, -100)                                   # labels of -100 are ignored within PyTorch CE loss
+    labels = torch.full_like(input_ids, -100, device=device)                    # labels of -100 are ignored within PyTorch CE loss
 
     # Default probs
     if mask_prob == 0.0 and rand_prob == 0.0 and keep_prob == 0.0:
@@ -62,8 +65,8 @@ def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob
     if to_mask.any():
         input_ids[to_mask] = mask_int
     if to_rand.any():
-        options = torch.tensor(tokenizer.encode(tokenizer.target_bp))   # [A,T,C,G]
-        rand_choices = options[torch.randint(0, len(options), input_ids.shape)]
+        options = torch.tensor(tokenizer.encode(tokenizer.target_bp), device=device)
+        rand_choices = options[torch.randint(0, len(options), input_ids.shape, device=device)]
         input_ids[to_rand] = rand_choices[to_rand]
     return input_ids, labels
 
