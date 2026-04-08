@@ -13,7 +13,7 @@ except ImportError:
     flash_attn_func = None
 
 # DSE 512
-from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter
+from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter, _F_Mean_B_ReduceScatter
 from dse.utils.config import Config
 
 
@@ -175,7 +175,27 @@ class TransformerBlock(nn.Module):
         return x                                    # [B, S_sub, D]
 
 
-class DNATransformerConfig(Config):
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size, dim, init_std=None):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, dim)
+        self.init_std = init_std if init_std is not None else 1 / math.sqrt(dim)
+
+    def init_weights(self):
+        # NOTE: Need to be careful with weight-tied initialization
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=self.init_std)
+
+    def forward(self, input_ids):
+        return self.embedding(input_ids)
+    
+    def embed(self, input_ids):
+        return self.forward(input_ids)
+    
+    def unembed(self, x):
+        return x @ self.embedding.weight.T
+
+
+class TransformerConfig(Config):
     def __init__(
         self,
         vocab_size: int = 4,
@@ -184,6 +204,8 @@ class DNATransformerConfig(Config):
         num_heads: int = 8,
         num_layers: int = 6,
         use_flash_attn: bool = False,
+        init_std: Optional[float] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
@@ -191,10 +213,11 @@ class DNATransformerConfig(Config):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.use_flash_attn = use_flash_attn
+        self.init_std = init_std if init_std is not None else 1 / math.sqrt(dim)
 
 
-class DNATransformer(nn.Module):
-    def __init__(self, cfg: DNATransformerConfig, parallel_state: Optional[ParallelState] = None):
+class TransformerBackbone(nn.Module):
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
         super().__init__()
         # Read
         self.cfg = cfg
@@ -211,7 +234,7 @@ class DNATransformer(nn.Module):
         self.sp_rank = parallel_state.sp_rank
 
         # Modules
-        self.token_emb = nn.Embedding(vocab_size, dim)
+        self.token_emb = TokenEmbedding(vocab_size, dim, init_std=cfg.init_std)
         self._register_rope(max_seq_len=max_seq_len, base=10000.0)
         self.blocks = nn.ModuleList(
             [
@@ -219,23 +242,7 @@ class DNATransformer(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.lm_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, vocab_size),  # NOTE: This is not tensor-parallelized because vocab_size is usually small
-        )
-
-    def no_wd_params(self):
-        # Specify parameters that should not receive weight decay
-        # (this is model specific and depends on variable names)
-        explicit = {"token_emb.embedding.weight", "lm_head.weight"}
-        exist = ("norm", "gamma", "beta")
-        affix = (".bias")
-
-        skip = set(explicit)
-        for name, _ in self.named_parameters():
-            if any(s in name for s in exist) or name.endswith(affix):
-                skip.add(name)
-        return skip
+        self.out_norm = nn.LayerNorm(dim)
         
     def _register_rope(self, max_seq_len: int = None, base: float = 10000.0):
         """
@@ -253,11 +260,7 @@ class DNATransformer(nn.Module):
         self.register_buffer("rope_cos", rope_cos, persistent=False)    # [S, D/2]
         self.register_buffer("rope_sin", rope_sin, persistent=False)    # [S, D/2]
 
-    def _update_context_len(self, new_context_len: int):
-        self.cfg.max_seq_len = new_context_len
-        self._register_rope(new_context_len)
-
-    def forward(self, input_ids, labels):   # both [B, S]
+    def forward(self, input_ids):                                       # [B, S_sub]
         # Setup
         B, S = input_ids.shape
 
@@ -272,15 +275,79 @@ class DNATransformer(nn.Module):
 
         # Split items for this sp rank's sequence chunk
         input_ids = input_ids[:, seq_start_idx:seq_end_idx]             # [B, S_sub]
-        labels = labels[:, seq_start_idx:seq_end_idx]                   # [B, S_sub]
         rope_cos = self.rope_cos[seq_start_idx:seq_end_idx, :]          # [S_sub, D/2]
         rope_sin = self.rope_sin[seq_start_idx:seq_end_idx, :]          # [S_sub, D/2]
 
         # Transformer blocks
-        x = self.token_emb(input_ids)                                   # [B, S_sub, D]
+        x = self.token_emb.embed(input_ids)                             # [B, S_sub, D]
         for block in self.blocks:
             x = block(x, rope_cos, rope_sin)
 
         # Output
-        logits = self.lm_head(x)                                        # [B, S_sub, V]
+        x = self.out_norm(x)                                            # [B, S_sub, D]
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
+        super().__init__()
+        self.backbone = TransformerBackbone(cfg, parallel_state=parallel_state)
+
+        # Initialization
+        self.post_init()
+
+    def post_init(self):
+        for module in self.modules():
+            if module is not self and hasattr(module, "init_weights") and callable(module.init_weights):
+                module.init_weights()
+
+    def no_wd_params(self):
+        # Specify parameters that should not receive weight decay
+        # (this is model specific and depends on variable names)
+        explicit = {"token_emb.embedding.weight"}
+        exist = ("norm", "gamma", "beta")
+        affix = (".bias")
+
+        skip = set(explicit)
+        for name, _ in self.named_parameters():
+            if any(s in name for s in exist) or name.endswith(affix):
+                skip.add(name)
+        return skip
+
+    def _update_context_len(self, new_context_len: int):
+        self.cfg.max_seq_len = new_context_len
+        self.backbone._register_rope(new_context_len)
+
+
+class MLMTransformer(Transformer):
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
+        super().__init__(cfg, parallel_state=parallel_state)
+        self.cfg = cfg
+        # NOTE: the class ParallelState holds non-distributed parallelism info by default
+        parallel_state = parallel_state if parallel_state is not None else ParallelState()
+        self.sp_group = parallel_state.sp_group
+        self.sp_size = parallel_state.sp_size
+        self.sp_rank = parallel_state.sp_rank
+
+    def forward(self, input_ids, labels):
+        # Setup
+        B, S = input_ids.shape
+
+        # Get sp-aware idx
+        if self.sp_size > 1:
+            assert S % self.sp_size == 0, "Sequence length must be divisible by sequence parallel size"
+            S_sub = S // self.sp_size
+            seq_start_idx = self.sp_rank * S_sub
+            seq_end_idx = min((self.sp_rank + 1) * S_sub, S)
+        else:
+            seq_start_idx, seq_end_idx = 0, S
+
+        # Split labels
+        labels = labels[:, seq_start_idx:seq_end_idx]           # [B, S_sub]
+        
+        # Run through backbone
+        x = self.backbone(input_ids)                            # [B, S_sub, D]
+
+        # Task-specific head
+        logits = self.backbone.token_emb.unembed(x)             # [B, S_sub, V]
         return logits, labels

@@ -10,8 +10,13 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 uv pip install ninja packaging psutil
 uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
-uv pip install numpy einops
+uv pip install numpy einops pysam pandas tqdm
 uv pip install flash-attn --no-build-isolation
+
+mkdir -p bin && cd bin
+curl -o datasets https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets
+chmod +x datasets
+export PATH=$(pwd):$PATH
 ```
 
 ## ISAAC (still under development)
@@ -21,7 +26,7 @@ export UV_CACHE_DIR=/place/with/storage
 
 uv init DSE512 --bare --python 3.12 && cd DSE512
 uv venv dse --python 3.12 --native-tls && source dse/bin/activate
-uv pip install torch numpy einops
+uv pip install torch numpy einops pysam pandas tqdm
 ```
 
 

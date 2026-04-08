@@ -1,3 +1,4 @@
+
 # General
 import json
 from pathlib import Path
@@ -6,9 +7,10 @@ from typing import Optional, Union
 # Torch
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
-from dse.model import DNATransformerConfig, DNATransformer
+from dse.model import TransformerConfig, MLMTransformer
 from dse.distributed import ParallelState, is_rank0, rank0_print, rank0_write, reduce_scalar, unwrap_model, resolve_device
 from dse.data import move_to
 from dse.utils import Config
@@ -56,7 +58,7 @@ class TrainerConfig(Config):
         return TrainerConfig(**cfg)
 
 
-class Trainer:
+class MLMTrainer:
     def __init__(self, config, model, device: Optional[Union[torch.device, str]] = None, parallel_state: Optional[ParallelState] = None):
         # Read args
         self.cfg = config
@@ -72,7 +74,7 @@ class Trainer:
 
         # Init trainer state
         self.last_step = 0
-        self.best_val_loss = float("inf")
+        self.best_val_loss = float("inf")    
 
     def _init_optimizer(self):
         self.optimizer, self.scheduler = init_optimizer_and_scheduler(
@@ -81,7 +83,7 @@ class Trainer:
             warmup_steps=self.cfg.warmup_steps,
             weight_decay=1e-4,
         )
-    
+
     def _init_cumulative_metrics(self, descriptors: list[str] | str):
         """
         These are used to accumulate metrics over multiple batches before averaging and logging.
@@ -232,7 +234,6 @@ class Trainer:
         
         # Log and reset
         self._log_metrics(desc)
-        self._init_cumulative_metrics([desc])  # Reset metrics
 
     def _run_eval(self):
         self.model.eval()
@@ -253,7 +254,7 @@ class Trainer:
         while self.last_step < end_step:
             self.optimizer.zero_grad(set_to_none=True)
             # Accumulate gradients
-            for _ in range(self.cfg.batches_per_step):
+            for batch_idx in range(self.cfg.batches_per_step):
                 # Forward
                 token_ids, labels = next(self.train_loader)     # [B, S] (int)
                 token_ids, labels = move_to(token_ids, self.device), move_to(labels, self.device)
@@ -264,7 +265,11 @@ class Trainer:
                 self._inc_metrics(loss, correct, count, self.descriptors[0])
                 # Properly scale the loss for grad calculation to account for parallelism and accumulation
                 grad_loss = self.true_local_loss(loss, count) / self.cfg.batches_per_step
-                grad_loss.backward()
+                if batch_idx < self.cfg.batches_per_step - 1 and isinstance(unwrap_model(self.model), DDP):
+                    with self.model.no_sync():
+                        grad_loss.backward()
+                else:
+                    grad_loss.backward()
             # Optimizer step
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -281,8 +286,11 @@ class Trainer:
             # Reached eval step
             if self.last_step % self.cfg.eval_every == 0:
                 self._run_eval()
-                if self.cumulative_metrics[self.descriptors[1]]["loss"] < self.best_val_loss:  # Check if best val loss
-                    self.best_val_loss = self.cumulative_metrics[self.descriptors[1]]["loss"]
+                val_num = self.cumulative_metrics[self.descriptors[2]]["loss"]
+                val_den = self.cumulative_metrics[self.descriptors[2]]["count"]
+                val_loss = val_num / val_den if val_den > 0 else float("inf")
+                if val_loss < self.best_val_loss:  # Check if best val loss
+                    self.best_val_loss = val_loss
                     self.save_checkpoint("best")
                 self.model.train()  # Switch back to train
 
@@ -314,7 +322,7 @@ class Trainer:
             torch.save(self.scheduler.state_dict(), save_dir / "scheduler.pt")
 
     @staticmethod
-    def load_checkpoint(dir: Union[Path, str], device: torch.device, parallel_state: ParallelState = None) -> "Trainer":
+    def load_checkpoint(dir: Union[Path, str], device: torch.device, parallel_state: ParallelState = None) -> "MLMTrainer":
         # Setup
         dir = Path(dir)
         parallel_state = parallel_state if parallel_state else ParallelState()
@@ -323,16 +331,16 @@ class Trainer:
         model_dict_path = dir / "model_config.json"
         with model_dict_path.open("r") as f:
             model_dict = json.load(f)
-        # NOTE: We only support DNATransformer here for simplicity
-        model_cfg = DNATransformerConfig(**model_dict)
-        model = DNATransformer(model_cfg, parallel_state).to(device)
-        state_dict = torch.load(dir / f"model.pt", weights_only=True)
+        # NOTE: We only support MLMTransformer here for simplicity
+        model_cfg = TransformerConfig(**model_dict)
+        model = MLMTransformer(model_cfg, parallel_state).to(device)
+        state_dict = torch.load(dir / f"model.pt", weights_only=True, map_location=device)
         model.load_state_dict(state_dict)
 
         # Trainer
         trainer_dict_path = dir / "trainer_config.json"
         trainer_cfg = TrainerConfig.load(trainer_dict_path)
-        trainer = Trainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
+        trainer = MLMTrainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
         trainer._load_state_dict(dir / "trainer.pt")
         # Optimizer / scheduler
         trainer._init_optimizer()

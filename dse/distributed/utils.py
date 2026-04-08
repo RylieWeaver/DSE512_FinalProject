@@ -28,7 +28,7 @@ def rank0_print(*args, **kwargs):
 def rank0_write(path, message: str, mode: str = "a"):
     if is_rank0():
         with path.open(mode) as f:
-            f.write(f"{message}")
+            f.write(f"\n{message}")
 
 def unwrap_model(model):
     if is_dist() and isinstance(model, DDP):

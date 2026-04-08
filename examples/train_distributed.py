@@ -8,11 +8,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
-from dse.train import TrainerConfig, Trainer
-from dse.model import DNATransformerConfig, DNATransformer
-from dse.data import DNADataset, create_random_dna_string
+from dse.train import TrainerConfig, MLMTrainer
+from dse.model import TransformerConfig, MLMTransformer
+from dse.data import DNADataset, MLMCollator, create_random_dna_string
 from dse.distributed import init_parallel_state, is_rank0, resolve_device
-from dse.utils import set_all_random_seeds
 
 
 
@@ -63,7 +62,6 @@ if __name__ == "__main__":
         sp_size=sp_size,
     )
     device = resolve_device(parallel_state=parallel_state)
-    set_all_random_seeds(42 + parallel_state.dp_rank)
 
     # Get dataset and loader
     data_path = base_dir / "dna.txt"
@@ -80,23 +78,24 @@ if __name__ == "__main__":
     dist.barrier()
     # The dataset and loader are created on all processes
     # NOTE: Dataset can be inspected with print(DNADataset.dna_string)
-    dataset = DNADataset(path=data_path, chunk_size=context_len, seed=parallel_state.rank + 42)
-    train_loader = torch.utils.data.DataLoader(dataset, batch_size=1)
-    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1)
-    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1)
+    dataset = DNADataset(path=data_path, chunk_size=context_len, parallel_state=parallel_state)
+    collator = MLMCollator(parallel_state=parallel_state)
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
+    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
 
     # Train from scratch if no resume step is provided
     if not resume_from_step:
         ## Define the model
-        model_cfg = DNATransformerConfig(
-            vocab_size=dataset.vocab_size,  # DNA vocab includes A/C/G/T plus N and [MASK]
+        model_cfg = TransformerConfig(
+            vocab_size=dataset.tokenizer.out_vocab_size,
             max_seq_len=context_len,
             dim=model_dim,
             num_heads=8,
             num_layers=6,
             use_flash_attn=True,
         )
-        model = DNATransformer(model_cfg, parallel_state).to(device)
+        model = MLMTransformer(model_cfg, parallel_state).to(device)
         ## Trainer configuration
         trainer_cfg = TrainerConfig(
             log_every=1,
@@ -110,12 +109,12 @@ if __name__ == "__main__":
             amp_dtype="bfloat16",
             amp_enabled=True
         )
-        trainer = Trainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
+        trainer = MLMTrainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
         trainer._init_optimizer()
     # Otherwise, train from checkpoint
     else:
         ckpt_dir = f"{base_dir}/checkpoints/step_{resume_from_step}"
-        trainer = Trainer.load_checkpoint(ckpt_dir, device, parallel_state=parallel_state)
+        trainer = MLMTrainer.load_checkpoint(ckpt_dir, device, parallel_state=parallel_state)
         if context_len > trainer.model.cfg.max_seq_len:
             trainer.model._update_context_len(new_context_len=context_len)
 
