@@ -1,16 +1,20 @@
 # General
 import random
 import warnings
+from pathlib import Path
 import pysam
+from typing import Union
+import pandas as pd
 
 # Torch
 import torch
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 
 # DSE 512
 from dse.distributed import ParallelState, rank0_print, rank0_write, is_rank0
 from .tokenizer import BPTokenizer
+from .utils import move_to, pad
 
 
 
@@ -127,45 +131,19 @@ class DNADataset(IterableDataset):
                 token_ids = torch.tensor(self.tokenizer.encode(chunk), dtype=torch.long)  # Str -> Tensor[token_id]
                 yield {"token_ids": token_ids}
             else:
-                token_ids = torch.empty(self.chunk_size, dtype=torch.long)
-                yield {"token_ids": token_ids}
+                yield {"token_ids": None}
 
 
 #################################################################
 ##### FASTA Dataset (must be at least 1 FASTA file to work) #####
 #################################################################
-def pad(x_list: list[torch.Tensor], pad_val, pad_length):
-    x_padded = []
-    pad_mask = []
-    for x in x_list:
-        L = x.size(0)
-        # Pad
-        if L < pad_length:
-            x_padded.append(
-                F.pad(x, (0, pad_length - L), value=pad_val)
-            )
-            pad_mask.append(torch.cat([torch.zeros(L, dtype=torch.long), torch.ones(pad_length - L, dtype=torch.long)]))
-        # Truncate
-        elif L > pad_length:
-            x_padded.append(x[:pad_length])
-            pad_mask.append(torch.zeros(pad_length, dtype=torch.long))
-        # No change
-        else:
-            x_padded.append(x)
-            pad_mask.append(torch.zeros(L, dtype=torch.long))
-    
-    x_padded = torch.stack(x_padded, dim=0)
-    pad_mask = torch.stack(pad_mask, dim=0)
-    pad_mask.requires_grad = False
-    return x_padded, pad_mask
-
-
-def mlm_collate_batch(batch, tokenizer, min_pad_length):
+def mlm_collate_batch(batch, tokenizer, min_pad_length, max_pad_length=None):
     # Setup
     pad_token_id = tokenizer.tok2id[tokenizer.PAD]
     B = len(batch)
     max_L = max(item["token_ids"].size(0) for item in batch)
     pad_length = max(max_L, min_pad_length)
+    pad_length = min(pad_length, max_pad_length) if max_pad_length is not None else pad_length
 
     # Initialize objects that are present in every batch
     token_ids_batch = []
@@ -191,23 +169,20 @@ def mlm_collate_batch(batch, tokenizer, min_pad_length):
 
 
 class MLMCollator:
-    def __init__(self, tokenizer=None, min_pad_length=2, parallel_state=None):
+    def __init__(self, tokenizer=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
         self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
-        self.min_pad_length = min_pad_length
         self.parallel_state = parallel_state if parallel_state else ParallelState()
+        self.min_pad_length = max(min_pad_length, self.parallel_state.sp_size)
+        self.max_pad_length = max_pad_length
     def __call__(self, batch):
-        # Max over minibatch and sp_group (necessary for consistent tensor shapes)
-        max_L = max(len(item["token_ids"]) for item in batch)
-        if self.parallel_state.sp_size > 1:
-            max_L_tensor = torch.tensor(max_L, device="cuda")
-            torch.distributed.all_reduce(max_L_tensor, op=torch.distributed.ReduceOp.MAX, group=self.parallel_state.sp_group)
-            max_L = max_L_tensor.item()
-        min_pad_length = max(self.min_pad_length, max_L)
         if self.parallel_state.sp_size == 1 or is_rank0(self.parallel_state.sp_group):
-            input_ids, labels = mlm_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length)
+            max_L = max(len(item["token_ids"]) for item in batch)
+            min_pad_length = max(self.min_pad_length, max_L)
+            min_pad_length = max(min_pad_length, self.parallel_state.sp_size)  # ensure divisible by sp_size
+            input_ids, labels = mlm_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length, max_pad_length=self.max_pad_length)
         else:
-            input_ids = torch.empty((len(batch), min_pad_length), dtype=torch.long)
-            labels = torch.full((len(batch), min_pad_length), -100, dtype=torch.long)
+            input_ids = None
+            labels = None
         return input_ids, labels
 
 
@@ -331,14 +306,17 @@ class FASTADataset(IterableDataset):
         file.close()
         return chunk
 
-    def __iter__(self):
-        # Setup on worker
+    def _init_random_state(self):
         # NOTE: Ensure different chunks on different ranks/workers by seeding differently
         worker = torch.utils.data.get_worker_info()
         rank_inc = self.parallel_state.rank if self.parallel_state is not None else 0
         worker_inc = worker.id if worker is not None else 0
         total_seed = self.base_seed + rank_inc + worker_inc
         self.random = random.Random(total_seed)
+
+    def __iter__(self):
+        # Setup on worker
+        self._init_random_state()
 
         # Infinite yielding
         while True:
@@ -351,5 +329,160 @@ class FASTADataset(IterableDataset):
                 yield {"token_ids": token_ids}
             else:
                 # Dummy chunk
-                token_ids = torch.empty(self.chunk_size, dtype=torch.long)
-                yield {"token_ids": token_ids}
+                yield {"token_ids": None}
+
+
+#################################################################
+##################### Doubling Time Dataset #####################
+#################################################################
+def sequence_regression_collate_batch(batch, tokenizer, min_pad_length, max_pad_length=None):
+    # Setup
+    pad_token_id = tokenizer.tok2id[tokenizer.PAD]
+    B = len(batch)
+    max_L = max(item["token_ids"].size(0) for item in batch)
+    pad_length = max(max_L, min_pad_length)
+    pad_length = min(pad_length, max_pad_length) if max_pad_length is not None else pad_length
+
+    # Initialize objects that are present in every batch
+    token_ids_batch, temps_batch, labels_batch = [], [], []
+
+    # Unpack the batch inputs
+    for item in batch:
+        token_ids_batch.append(item["token_ids"])
+        temps_batch.append(item["temperatures"])
+        labels_batch.append(item["labels"])
+
+    # Pad / Stack
+    # NOTE: Pad mask unused for now
+    token_ids_batch, pad_mask = pad(token_ids_batch, pad_val=pad_token_id, pad_length=pad_length)       # [B, max_L]
+    labels_batch = torch.stack(labels_batch, dim=0)                                                     # [B, output_dim]
+    inputs = {"token_ids": token_ids_batch, "temperatures": torch.tensor(temps_batch, dtype=torch.float)}
+    return inputs, labels_batch
+
+
+class SequenceRegressionCollator:
+    def __init__(self, tokenizer=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
+        self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
+        self.parallel_state = parallel_state if parallel_state else ParallelState()
+        self.min_pad_length = max(min_pad_length, self.parallel_state.sp_size)
+        self.max_pad_length = max_pad_length
+    def __call__(self, batch):
+        if self.parallel_state.sp_size == 1 or is_rank0(self.parallel_state.sp_group):
+            max_L = max(len(item["token_ids"]) for item in batch)
+            min_pad_length = max(self.min_pad_length, max_L)
+            min_pad_length = max(min_pad_length, self.parallel_state.sp_size)  # ensure divisible by sp_size
+            input_ids, labels = sequence_regression_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length, max_pad_length=self.max_pad_length)
+        else:
+            input_ids = None
+            labels = None
+        return input_ids, labels
+
+
+class DoublingTimeDataset(Dataset):
+    """
+    Expects to read from a TSV/CSV file.
+    """
+    def __init__(
+        self,
+        df_path: Union[Path, str],
+        sequence_col: str = "sequence",
+        temperature_col: str = "growth_tmp",
+        target_cols: list[str] | str | None = None,
+        base_seed: int = 42,
+        tokenizer=None,
+        drop_missing: bool = True,
+        parallel_state=None,
+    ):
+        super().__init__()
+        self.df_path = Path(df_path)
+        self.sequence_col = sequence_col
+        self.temperature_col = temperature_col
+        if target_cols is None:
+            target_cols = ["log_dob_h"]
+        self.target_cols = target_cols if isinstance(target_cols, list) else [target_cols]
+        self.base_seed = base_seed
+        self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
+        self.drop_missing = drop_missing
+        self.parallel_state = parallel_state if parallel_state else ParallelState()
+        self.random = None
+        self.random_seed = None
+        self.df = self._read_df(drop_missing=drop_missing)
+
+    def _read_df(self, drop_missing: bool):
+        # Read file
+        if not self.df_path.exists():
+            raise FileNotFoundError(f"Could not find dataframe file: {self.df_path}")
+        suffix = self.df_path.suffix.lower()
+        sep = "\t" if suffix == ".tsv" else ","
+        df = pd.read_csv(self.df_path, sep=sep)
+
+        # Filter columns
+        if self.sequence_col not in df.columns:
+            raise KeyError(f"Missing sequence column '{self.sequence_col}' in {self.df_path}")
+        for target_col in self.target_cols:
+            if target_col not in df.columns:
+                raise KeyError(f"Missing target column '{target_col}' in {self.df_path}")
+        if self.temperature_col not in df.columns:
+            raise KeyError(f"Missing temperature column '{self.temperature_col}' in {self.df_path}")
+        keep_cols = [self.sequence_col] + self.target_cols + [self.temperature_col]  # temperature_col is needed for the model but not necessarily a target
+        if "assembly_id" in df.columns:
+            keep_cols.append("assembly_id")
+        df = df[keep_cols].copy()
+
+        # Set types
+        df[self.sequence_col] = df[self.sequence_col].astype("string")
+        for target_col in self.target_cols:
+            df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+
+        # Drop missing rows
+        if drop_missing:
+            df = df.dropna(subset=[self.sequence_col] + self.target_cols + [self.temperature_col])
+
+        if len(df) == 0:
+            raise ValueError(f"No usable rows found in dataframe file: {self.df_path}")
+        df = df.reset_index(drop=True)
+        return df
+
+    def get_std_norm_stats(self):
+        stats = {}
+        for target_col in self.target_cols:
+            mean = self.df[target_col].mean()
+            std = self.df[target_col].std()
+            stats[target_col] = {"mean": mean, "std": std}
+        return stats
+
+    def __len__(self):
+        return len(self.df)
+
+    def _init_random_state(self):
+        worker = torch.utils.data.get_worker_info()
+        rank_inc = self.parallel_state.rank if self.parallel_state is not None else 0
+        worker_inc = worker.id if worker is not None else 0
+        total_seed = self.base_seed + rank_inc + worker_inc
+        if self.random_seed != total_seed:
+            self.random = random.Random(total_seed)
+            self.random_seed = total_seed
+
+    def __getitem__(self, idx):
+        # Setup
+        self._init_random_state()
+
+        # Only one of SP-group needs to read/process sequence
+        if self.parallel_state.sp_size > 1 and not is_rank0(self.parallel_state.sp_group):
+            return {
+                "token_ids": None,
+                "temperatures": None,
+                "labels": None,
+            }
+        row = self.df.iloc[idx]
+        sequence = str(row[self.sequence_col]).strip().upper()
+        token_ids = torch.tensor(self.tokenizer.encode(sequence), dtype=torch.long)
+        labels = torch.tensor([float(row[target_col]) for target_col in self.target_cols], dtype=torch.float32)
+        item = {
+            "token_ids": token_ids,
+            "temperatures": float(row[self.temperature_col]),
+            "labels": labels,
+        }
+        if "assembly_id" in self.df.columns and pd.notna(row["assembly_id"]):
+            item["assembly_id"] = row["assembly_id"]
+        return item

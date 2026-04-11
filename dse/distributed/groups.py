@@ -19,6 +19,7 @@ class ParallelState:
     rank: int = 0
     local_rank: int = 0
     backend: str = "none"
+    grad_sync_type: str = "world"
 
     dp_size: int = 1
     sp_size: int = 1
@@ -29,6 +30,7 @@ class ParallelState:
     dp_group: Optional[dist.ProcessGroup] = None
     sp_group: Optional[dist.ProcessGroup] = None
     world_group: Optional[dist.ProcessGroup] = None
+    grad_sync_group: Optional[dist.ProcessGroup] = None
     device: Optional[torch.device] = None
 
 
@@ -40,7 +42,7 @@ def rank2coords(rank: int, dp_size: int, sp_size: int) -> tuple[int, int]:
 def coords2rank(dp_rank: int, sp_rank: int, dp_size: int, sp_size: int) -> int:
     return (dp_rank * sp_size) + sp_rank
 
-def build_groups(dp_size: int, sp_size: int):
+def build_groups(dp_size: int, sp_size: int, grad_sync_type: str = "world"):
     """
     Groups must be defined for all processes. Group membership can be determined
     by when the idx for all the fixed parallelism dimensions match the current process's
@@ -49,7 +51,7 @@ def build_groups(dp_size: int, sp_size: int):
     # Setup
     rank = dist.get_rank()  # NOTE: This could be passed but is just read from ground-truth dist
     dp_rank, sp_rank = rank2coords(rank, dp_size, sp_size)
-    my_sp_group = my_dp_group = my_world_group = None
+    my_sp_group = my_dp_group = my_world_group = my_grad_sync_group = None
 
     # SP groups: one for each (dp_rank), varying sp_rank
     for d in range(dp_size):
@@ -71,9 +73,19 @@ def build_groups(dp_size: int, sp_size: int):
     ranks = list(range(dp_size * sp_size))
     my_world_group = dist.new_group(ranks)
 
+    # Grad sync group
+    if grad_sync_type == "world":
+        my_grad_sync_group = my_world_group
+    elif grad_sync_type == "dp":
+        my_grad_sync_group = my_dp_group
+    elif grad_sync_type == "sp":
+        my_grad_sync_group = my_sp_group
+    else:
+        raise ValueError(f"Invalid grad_sync_type: {grad_sync_type}")
+
     # Check to make sure the process found its groups
-    assert my_dp_group and my_sp_group and my_world_group, "Failed to build process groups"
-    return (dp_rank, sp_rank), (my_dp_group, my_sp_group, my_world_group)
+    assert my_dp_group and my_sp_group and my_world_group and my_grad_sync_group, "Failed to build process groups"
+    return (dp_rank, sp_rank), (my_dp_group, my_sp_group, my_world_group, my_grad_sync_group)
 
 
 def init_parallel_state(
@@ -81,6 +93,7 @@ def init_parallel_state(
     master_port: Optional[int] = None,
     dp_size: int = 1,
     sp_size: int = 1,
+    grad_sync_type: str = "world",
     silence_warnings_nonzero_rank: bool = True,
 ) -> ParallelState:
     # Read args
@@ -128,7 +141,7 @@ def init_parallel_state(
     if silence_warnings_nonzero_rank and rank != 0:
         warnings.filterwarnings("ignore")
 
-    (dp_rank, sp_rank), (dp_group, sp_group, world_group) = build_groups(dp_size, sp_size)
+    (dp_rank, sp_rank), (dp_group, sp_group, world_group, grad_sync_group) = build_groups(dp_size, sp_size, grad_sync_type=grad_sync_type)
 
     rank0_print(
         f"[ParallelState] world_size={world_size} dp={dp_size} sp={sp_size} backend={backend}"
@@ -138,6 +151,8 @@ def init_parallel_state(
         world_size=world_size,
         rank=rank,
         local_rank=local_rank,
+        backend=backend,
+        grad_sync_type=grad_sync_type,
         dp_size=dp_size,
         sp_size=sp_size,
         dp_rank=dp_rank,
@@ -145,6 +160,6 @@ def init_parallel_state(
         dp_group=dp_group,
         sp_group=sp_group,
         world_group=world_group,
-        backend=backend,
+        grad_sync_group=grad_sync_group,
         device=device,
     )

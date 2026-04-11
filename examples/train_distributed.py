@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
-from dse.train import TrainerConfig, MLMTrainer
+from dse.train import MLMTrainerConfig, MLMTrainer
 from dse.model import TransformerConfig, MLMTransformer
 from dse.data import DNADataset, MLMCollator, create_random_dna_string
 from dse.distributed import init_parallel_state, is_rank0, resolve_device
@@ -80,9 +80,9 @@ if __name__ == "__main__":
     # NOTE: Dataset can be inspected with print(DNADataset.dna_string)
     dataset = DNADataset(path=data_path, chunk_size=context_len, parallel_state=parallel_state)
     collator = MLMCollator(parallel_state=parallel_state)
-    train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
-    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
-    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=4)
+    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=4)
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator, num_workers=4)
 
     # Train from scratch if no resume step is provided
     if not resume_from_step:
@@ -97,7 +97,7 @@ if __name__ == "__main__":
         )
         model = MLMTransformer(model_cfg, parallel_state).to(device)
         ## Trainer configuration
-        trainer_cfg = TrainerConfig(
+        trainer_cfg = MLMTrainerConfig(
             log_every=1,
             eval_every=100,
             eval_batches=10,

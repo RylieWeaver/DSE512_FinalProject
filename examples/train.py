@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 # DSE 512
-from dse.train import TrainerConfig, MLMTrainer
+from dse.train import MLMTrainerConfig, MLMTrainer
 from dse.model import TransformerConfig, MLMTransformer
 from dse.data import DNADataset, MLMCollator, create_random_dna_string
 from dse.distributed import resolve_device
@@ -60,8 +60,8 @@ if __name__ == "__main__":
     dataset = DNADataset(path=data_path, chunk_size=context_len, base_seed=42)
     collator = MLMCollator(min_pad_length=context_len)
     train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
-    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)  # Using the same dataset for validation for simplicity
-    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)  # Using the same dataset for testing for simplicity
+    val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=1, collate_fn=collator)
 
     # Train from scratch if no resume step is provided
     if not resume_from:
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         )
         model = MLMTransformer(model_cfg).to(device)
         ## Trainer configuration
-        trainer_cfg = TrainerConfig(
+        trainer_cfg = MLMTrainerConfig(
             log_every=1,
             eval_every=100,
             eval_batches=10,

@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 # DSE 512
-from dse.train import TrainerConfig, MLMTrainer
+from dse.train import MLMTrainerConfig, MLMTrainer
 from dse.model import TransformerConfig, MLMTransformer
 from dse.data import FASTADataset, MLMCollator, BPTokenizer
 from dse.distributed import resolve_device, rank0_print
@@ -14,17 +14,17 @@ from dse.distributed import resolve_device, rank0_print
 
 
 # Commands:
-# - python train_mlm.py --context_len 2048 --model_dim 1024
+# - python train_mlm.py --context_len 2048 --model_dim 256
 
 
 if __name__ == "__main__":
     # Setup
     parser = argparse.ArgumentParser()
     parser.add_argument("--context_len", type=int, default=2048, help="Context length for model")
-    parser.add_argument("--model_dim", type=int, default=1024, help="Model dimension")
+    parser.add_argument("--model_dim", type=int, default=256, help="Model dimension")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of linear warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of linear warmup steps")
     parser.add_argument("--resume_from", type=str, default=None, help="Directory to resume training from checkpoint")
     args = parser.parse_args()
     context_len = args.context_len
@@ -33,22 +33,22 @@ if __name__ == "__main__":
     learning_rate = args.learning_rate
     warmup_steps = args.warmup_steps
     resume_from = args.resume_from
-    ckpt_dir = Path("/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch").resolve()
+    ckpt_dir = Path("/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/mlm").resolve()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Device setup
     device = resolve_device()
 
     # Get datasets and loaders
-    data_dir = Path("/mnt/DGX01/Personal/r9w/Datasets/Microbial")
+    data_dir = Path("/mnt/DGX01/Personal/r9w/Datasets/Microbial/reference")
     tokenizer = BPTokenizer()
     train_dataset = FASTADataset(fasta_dir=(data_dir / "train"), chunk_size=context_len, tokenizer=tokenizer)
     val_dataset = FASTADataset(fasta_dir=(data_dir / "val"), chunk_size=context_len, tokenizer=tokenizer)
     test_dataset = FASTADataset(fasta_dir=(data_dir / "test"), chunk_size=context_len, tokenizer=tokenizer)
-    collator = MLMCollator(tokenizer=tokenizer, min_pad_length=context_len)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=collator)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collator)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, collate_fn=collator)
+    collator = MLMCollator(tokenizer=tokenizer)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, collate_fn=collator)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, collate_fn=collator)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=16, collate_fn=collator)
 
     # Train from scratch if no resume step is provided
     if not resume_from:
@@ -60,10 +60,14 @@ if __name__ == "__main__":
             num_heads=8,
             num_layers=24,
             use_flash_attn=True,
+            embed_dropout=0.0,
+            attn_dropout=0.0,
+            resid_dropout=0.0,
+            head_dropout=0.0,
         )
         model = MLMTransformer(model_cfg).to(device)
         ## Trainer configuration
-        trainer_cfg = TrainerConfig(
+        trainer_cfg = MLMTrainerConfig(
             log_every=1,
             eval_every=100,
             eval_batches=10,

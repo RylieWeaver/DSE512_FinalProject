@@ -1,1 +1,1 @@
-from .transformer import TransformerConfig, TransformerBackbone, MLMTransformer
+from .transformer import TransformerConfig, TransformerBackbone, MLMTransformer, SequenceRegressionTransformer

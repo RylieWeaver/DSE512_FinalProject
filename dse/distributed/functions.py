@@ -47,15 +47,16 @@ class _F_Gather_B_ReduceScatter(Function):
 
 class _F_Mean_B_ReduceScatter(Function):
     @staticmethod
-    def forward(ctx, x_shard, group, dim: int = 1):
+    def forward(ctx, x_shard, group):
         ctx.group = group
         ctx.world = dist.get_world_size(group=group)
-        x_mean = x_shard.contiguous()
-        dist.all_reduce(x_mean, op=dist.ReduceOp.SUM, group=group)
-        return x_mean / ctx.world
+        x_shard = x_shard.contiguous()
+        dist.all_reduce(x_shard, op=dist.ReduceOp.SUM, group=group)
+        x_mean = x_shard / ctx.world
+        return x_mean
 
     @staticmethod
     def backward(ctx, grad_mean):
         grad_shard = grad_mean.contiguous()
         dist.all_reduce(grad_shard, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad_shard / ctx.world, None, None
+        return grad_shard / ctx.world, None
