@@ -48,3 +48,29 @@ def reduce_scalar(x, device: torch.device, group: dist.ProcessGroup, dtype=torch
     if average:
         x /= dist.get_world_size(group)
     return float(x.item())
+
+def broadcast_tensor(x, group, device, src=None, dtype=torch.float32):
+    # Default to broadcast from rank 0 of the group, unless specified
+    if src is None:
+        src = dist.get_global_rank(group, 0)
+    is_src = dist.get_rank() == src
+
+    # 1. Broadcast ndims
+    ndim = torch.empty(1, dtype=torch.long, device=device)
+    if is_src:
+        ndim[0] = x.ndim
+    dist.broadcast(ndim, src=src, group=group)
+    ndim = int(ndim.item())
+
+    # 2. Broadcast shape 
+    shape = torch.empty(ndim, dtype=torch.long, device=device)
+    if is_src:
+        shape[:] = torch.tensor(x.shape, dtype=torch.long, device=device)
+    dist.broadcast(shape, src=src, group=group)
+    shape = tuple(shape.tolist())
+
+    # 3. Broadcast tensor
+    if not is_src:
+        x = torch.empty(shape, dtype=dtype, device=device)
+    dist.broadcast(x, src=src, group=group)
+    return x

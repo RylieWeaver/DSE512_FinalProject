@@ -7,14 +7,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-try:
-    from flash_attn import flash_attn_func
-except ImportError:
-    flash_attn_func = None
 
 # DSE 512
-from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter, _F_Mean_B_ReduceScatter
+from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter, _F_Mean_B_ReduceScatter, rank0_print
 from dse.utils.config import Config
+
+# Optional
+try:
+    from flash_attn import flash_attn_func
+    rank0_print("Flash Attention imported successfully.")
+except ImportError:
+    flash_attn_func = None
 
 
 
@@ -76,7 +79,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, parallel_state, use_flash_attn=False):
+    def __init__(self, dim, num_heads, parallel_state, attn_dropout=0.0, use_flash_attn=False):
         super().__init__()
         # Read/check
         self.parallel_state = parallel_state
@@ -88,9 +91,13 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.use_flash_attn = use_flash_attn and flash_attn_func is not None
+        self.attn_dropout_p = attn_dropout
+        self.attn_dropout = nn.Dropout(attn_dropout)
 
         # Modules
         self.qkv = nn.Linear(dim, 3*dim)
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
         self.out_proj = nn.Linear(dim, dim)
 
     def forward(self, x, rope_cos, rope_sin):                                               # x: [B, S_sub, D] | rope_cos/sin: [S, D/2]
@@ -99,8 +106,10 @@ class Attention(nn.Module):
 
         # Compute local QKV
         qkv = self.qkv(x)                                                                   # [B, S_sub, 3*D]
-        qkv = qkv.view(B, S_sub, self.num_heads, 3 * self.head_dim)                         # [B, S_sub, H, 3*D_head]
-        q, k, v = qkv.split(self.head_dim, dim=-1)                                          # [B, S_sub, H, D_head] (each)
+        qkv = qkv.reshape(B, S_sub, self.num_heads, 3 * self.head_dim)                      # [B, S_sub, H, 3*D_head]
+        q, k, v = torch.split(qkv, self.head_dim, dim=-1)                                   # each [B, S_sub, H, D_head]
+        q = self.q_norm(q)                                                                  # [B, S_sub, H, D_head]
+        k = self.k_norm(k)                                                                  # [B, S_sub, H, D_head]
 
         # Apply RoPE to local QKV
         q = apply_rope(q, rope_cos, rope_sin)                                               # [B, S_sub, H, D_head]
@@ -128,7 +137,7 @@ class Attention(nn.Module):
                 q.contiguous().to(torch.bfloat16),
                 k.contiguous().to(torch.bfloat16),
                 v.contiguous().to(torch.bfloat16),
-                dropout_p=0.0,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
                 softmax_scale=self.scale,
                 causal=False,
             )
@@ -136,6 +145,7 @@ class Attention(nn.Module):
         else:
             attn_logits = torch.einsum("bshd,bShd->bsSh", q, k) * self.scale                # [B, S_sub, S, H]
             attn_weights = F.softmax(attn_logits, dim=2)                                    # [B, S_sub, S, H]
+            attn_weights = self.attn_dropout(attn_weights)                                  # [B, S_sub, S, H]
             attn_scaled_values = torch.einsum("bsSh,bShd->bshd", attn_weights, v)           # [B, S_sub, H, D_head]
 
         # Concat heads and output projection
@@ -160,18 +170,25 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, parallel_state, use_flash_attn=False):
+    def __init__(self, dim, num_heads, parallel_state, attn_dropout=0.0, resid_dropout=0.0, use_flash_attn=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, parallel_state, use_flash_attn=use_flash_attn)
+        self.attn = Attention(
+            dim,
+            num_heads,
+            parallel_state,
+            attn_dropout=attn_dropout,
+            use_flash_attn=use_flash_attn,
+        )
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, parallel_state)
+        self.resid_dropout = nn.Dropout(resid_dropout)
 
     def forward(self, x, rope_cos, rope_sin):       # each [B, S_sub, D]
         h = self.ln1(x)                             # [B, S_sub, D]
         attn = self.attn(h, rope_cos, rope_sin)     # [B, S_sub, D]
-        x = x + attn                                # [B, S_sub, D]
-        x = x + self.mlp(self.ln2(x))               # [B, S_sub, D]
+        x = x + self.resid_dropout(attn)            # [B, S_sub, D]
+        x = x + self.resid_dropout(self.mlp(self.ln2(x)))  # [B, S_sub, D]
         return x                                    # [B, S_sub, D]
 
 
@@ -205,6 +222,10 @@ class TransformerConfig(Config):
         num_layers: int = 6,
         use_flash_attn: bool = False,
         init_std: Optional[float] = None,
+        embed_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        head_dropout: float = 0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -214,6 +235,12 @@ class TransformerConfig(Config):
         self.num_layers = num_layers
         self.use_flash_attn = use_flash_attn
         self.init_std = init_std if init_std is not None else 1 / math.sqrt(dim)
+        self.embed_dropout = embed_dropout
+        self.attn_dropout = attn_dropout
+        self.resid_dropout = resid_dropout
+        self.head_dropout = head_dropout
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class TransformerBackbone(nn.Module):
@@ -235,10 +262,18 @@ class TransformerBackbone(nn.Module):
 
         # Modules
         self.token_emb = TokenEmbedding(vocab_size, dim, init_std=cfg.init_std)
+        self.embed_dropout = nn.Dropout(cfg.embed_dropout)
         self._register_rope(max_seq_len=max_seq_len, base=10000.0)
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(dim, num_heads, parallel_state=parallel_state, use_flash_attn=self.use_flash_attn)
+                TransformerBlock(
+                    dim,
+                    num_heads,
+                    parallel_state=parallel_state,
+                    attn_dropout=cfg.attn_dropout,
+                    resid_dropout=cfg.resid_dropout,
+                    use_flash_attn=self.use_flash_attn,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -279,7 +314,7 @@ class TransformerBackbone(nn.Module):
         rope_sin = self.rope_sin[seq_start_idx:seq_end_idx, :]          # [S_sub, D/2]
 
         # Transformer blocks
-        x = self.token_emb.embed(input_ids)                             # [B, S_sub, D]
+        x = self.embed_dropout(self.token_emb.embed(input_ids))         # [B, S_sub, D]
         for block in self.blocks:
             x = block(x, rope_cos, rope_sin)
 
@@ -323,6 +358,7 @@ class MLMTransformer(Transformer):
     def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
         super().__init__(cfg, parallel_state=parallel_state)
         self.cfg = cfg
+        self.head_dropout = nn.Dropout(cfg.head_dropout)
         # NOTE: the class ParallelState holds non-distributed parallelism info by default
         parallel_state = parallel_state if parallel_state is not None else ParallelState()
         self.sp_group = parallel_state.sp_group
@@ -349,5 +385,73 @@ class MLMTransformer(Transformer):
         x = self.backbone(input_ids)                            # [B, S_sub, D]
 
         # Task-specific head
+        x = self.head_dropout(x)                               # [B, S_sub, D]
         logits = self.backbone.token_emb.unembed(x)             # [B, S_sub, V]
         return logits, labels
+
+
+class SequenceRegressionTransformer(Transformer):
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
+        super().__init__(cfg, parallel_state=parallel_state)
+        self.cfg = cfg
+        output_dim = self.cfg.output_dim if hasattr(self.cfg, "output_dim") else 1
+        # NOTE: the class ParallelState holds non-distributed parallelism info by default
+        parallel_state = parallel_state if parallel_state is not None else ParallelState()
+        self.sp_group = parallel_state.sp_group
+        self.sp_size = parallel_state.sp_size
+        self.sp_rank = parallel_state.sp_rank
+        
+        # Modules
+        self.temp_embed = nn.Sequential(
+            nn.Linear(1, cfg.dim),
+            nn.SiLU(),
+            nn.Linear(cfg.dim, cfg.dim),
+            nn.LayerNorm(cfg.dim),
+        )
+        self.head_dropout = nn.Dropout(cfg.head_dropout)
+        self.output_head = nn.Sequential(
+            nn.Linear(2 * cfg.dim, 2 * cfg.dim),
+            nn.SiLU(),
+            nn.Linear(2 * cfg.dim, output_dim),
+        )
+
+    def forward(self, batch, labels):
+        # Setup
+        input_ids = batch["token_ids"]      # [B, S]
+        temps = batch["temperatures"]       # [B]
+        B, S = input_ids.shape
+
+        # Get sp-aware idx
+        if self.sp_size > 1:
+            assert S % self.sp_size == 0, "Sequence length must be divisible by sequence parallel size"
+            S_sub = S // self.sp_size
+            seq_start_idx = self.sp_rank * S_sub
+            seq_end_idx = min((self.sp_rank + 1) * S_sub, S)
+        else:
+            seq_start_idx, seq_end_idx = 0, S
+        
+        # Run through backbone
+        x = self.backbone(input_ids)                                # [B, S_sub, D]
+        t = self.temp_embed(temps.reshape(-1, 1))                   # [B, 1, D]
+
+        # Mean-pool the sequence
+        ### NOTE: Maybe do attention pooling later? 
+        ### Mean pooling isn't very robust to padding...
+        ## Head dropout first
+        x = self.head_dropout(x)                                    # [B, S_sub, D]
+        ## Local
+        x = x.mean(dim=1)                                           # [B, D]
+        ## Sequence parallel
+        ### NOTE: Flipping the mean order is mathematically equivalent
+        ### because all sp-parallel chunks are the same length, but 
+        ### this order is cheaper because we communicate smaller objects.
+        if self.sp_size > 1:
+            x = _F_Mean_B_ReduceScatter.apply(x, self.sp_group)     # [B, D]
+
+        # Output
+        ## NOTE: Not advised to have dropout before loss without any
+        ## sp-sync because sp-parallel reps will be different, and then
+        ## grads necessarily have to sync across all sp - otherwise not!
+        x = torch.cat((x, t), dim=-1)                               # [B, 2*D]
+        preds = self.output_head(x)                                 # [B, output_dim]
+        return preds, labels
