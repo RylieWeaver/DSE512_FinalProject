@@ -5,6 +5,7 @@ import argparse
 import csv
 import math
 import re
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -22,6 +23,12 @@ LOG_RE = re.compile(
     r"(?P<split>Train w/o Grad|Train w/ Grad|Eval|Test)\s+"
     r"Loss:\s+(?P<loss>[0-9.]+)"
 )
+
+SPLIT_ORDER = ["Train w/ Grad", "Test", "Eval", "Train w/o Grad"]
+X_AXES = [
+    ("log10_tokens", "log10 training tokens"),
+    ("log10_compute", "log10 analytical training FLOPs"),
+]
 
 
 def parse_args():
@@ -58,9 +65,20 @@ def parse_args():
     parser.add_argument("--vocab-size", type=int, default=6)
     parser.add_argument("--max-loss", type=float, default=None, help="Optional y-axis filter.")
     parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.9,
+        help="EMA history factor in [0, 1]. Higher means smoother (e.g., 0.99). Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--ema-unbiased",
+        action="store_true",
+        help="Apply bias-corrected (unbiased) EMA instead of standard EMA.",
+    )
+    parser.add_argument(
         "--min-step",
         type=int,
-        default=600,
+        default=100,
         help="Drop loss points before this training step. Use 1 to remove initialization anchors.",
     )
     return parser.parse_args()
@@ -200,22 +218,31 @@ def _style_maps(points):
         model_dim: cmap(idx % cmap.N)
         for idx, model_dim in enumerate(model_dims)
     }
-    linestyles = ["-", "--", ":", "-.", (0, (5, 2, 1, 2, 1, 2)), (0, (3, 1, 1, 1))]
-    linestyle_by_context = {
-        context_len: linestyles[idx % len(linestyles)]
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    marker_by_context = {
+        context_len: markers[idx % len(markers)]
         for idx, context_len in enumerate(context_lens)
     }
-    return color_by_dim, linestyle_by_context
+    return color_by_dim, marker_by_context
 
 
-def _add_style_legends(ax, color_by_dim, linestyle_by_context):
+def _add_style_legends(ax, color_by_dim, marker_by_context):
     dim_handles = [
         Line2D([0], [0], color=color, lw=2, label=f"dim {model_dim}")
         for model_dim, color in color_by_dim.items()
     ]
     context_handles = [
-        Line2D([0], [0], color="0.25", lw=2, linestyle=linestyle, label=f"ctx {context_len}")
-        for context_len, linestyle in linestyle_by_context.items()
+        Line2D(
+            [0],
+            [0],
+            color="0.25",
+            lw=1.2,
+            linestyle="-",
+            marker=marker,
+            markersize=5,
+            label=f"ctx {context_len}",
+        )
+        for context_len, marker in marker_by_context.items()
     ]
 
     dim_legend = ax.legend(handles=dim_handles, title="Model dim", fontsize=7, title_fontsize=8, loc="upper right")
@@ -223,22 +250,50 @@ def _add_style_legends(ax, color_by_dim, linestyle_by_context):
     ax.legend(handles=context_handles, title="Context length", fontsize=7, title_fontsize=8, loc="lower left")
 
 
-def _plot_split(ax, points, split, x_key, x_label, color_by_dim, linestyle_by_context):
-    grouped = {}
-    for point in points:
-        if point["split"] != split:
-            continue
-        grouped.setdefault(point["run_name"], []).append(point)
+def apply_ema(values, alpha, unbiased=False):
+    if not values or alpha <= 0:
+        return list(values)
+    if alpha >= 1:
+        return [values[0]] * len(values)
 
-    for run_name, run_points in grouped.items():
+    beta = alpha
+    one_minus_beta = 1.0 - beta
+    if not unbiased:
+        # Use the first observation as the EMA initial state to avoid a
+        # misleadingly low first plotted point from zero-state warm start.
+        avg = values[0]
+        smoothed = [avg]
+        for value in values[1:]:
+            avg = beta * avg + one_minus_beta * value
+            smoothed.append(avg)
+        return smoothed
+
+    avg = 0.0
+    beta_power = 1.0
+    smoothed = []
+    for value in values:
+        avg = beta * avg + one_minus_beta * value
+        beta_power *= beta
+        correction = 1.0 - beta_power
+        smoothed.append(avg / correction if correction > 0 else value)
+    return smoothed
+
+
+def _plot_split(ax, points, split, x_key, x_label, color_by_dim, marker_by_context, ema_alpha, ema_unbiased):
+    grouped = defaultdict(list)
+    for point in points:
+        if point["split"] == split:
+            grouped[point["run_name"]].append(point)
+
+    for run_points in grouped.values():
         run_points = sorted(run_points, key=lambda point: point["step"])
         first = run_points[0]
         ax.plot(
             [point[x_key] for point in run_points],
-            [point["loss"] for point in run_points],
+            apply_ema([point["loss"] for point in run_points], ema_alpha, unbiased=ema_unbiased),
             color=color_by_dim[first["model_dim"]],
-            linestyle=linestyle_by_context[first["context_len"]],
-            marker="o",
+            linestyle="-",
+            marker=marker_by_context[first["context_len"]],
             markersize=2.5 if split == "Train w/ Grad" else 3.5,
             linewidth=1.2,
             alpha=0.9,
@@ -250,9 +305,9 @@ def _plot_split(ax, points, split, x_key, x_label, color_by_dim, linestyle_by_co
     ax.grid(True, alpha=0.3)
 
 
-def plot_points(points, x_key, x_label, path):
-    splits = [split for split in ["Train w/ Grad", "Test", "Eval", "Train w/o Grad"] if any(point["split"] == split for point in points)]
-    color_by_dim, linestyle_by_context = _style_maps(points)
+def plot_points(points, x_key, x_label, path, ema_alpha, ema_unbiased):
+    splits = [split for split in SPLIT_ORDER if any(point["split"] == split for point in points)]
+    color_by_dim, marker_by_context = _style_maps(points)
 
     fig, axes = plt.subplots(
         len(splits),
@@ -263,23 +318,43 @@ def plot_points(points, x_key, x_label, path):
     )
 
     for ax, split in zip(axes[:, 0], splits):
-        _plot_split(ax, points, split, x_key, x_label, color_by_dim, linestyle_by_context)
+        _plot_split(
+            ax,
+            points,
+            split,
+            x_key,
+            x_label,
+            color_by_dim,
+            marker_by_context,
+            ema_alpha,
+            ema_unbiased,
+        )
 
-    _add_style_legends(axes[0, 0], color_by_dim, linestyle_by_context)
+    _add_style_legends(axes[0, 0], color_by_dim, marker_by_context)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
-def plot_single_curve(points, split, x_key, x_label, path):
+def plot_single_curve(points, split, x_key, x_label, path, ema_alpha, ema_unbiased):
     split_points = [point for point in points if point["split"] == split]
     if not split_points:
         return False
 
-    color_by_dim, linestyle_by_context = _style_maps(points)
+    color_by_dim, marker_by_context = _style_maps(points)
     fig, ax = plt.subplots(figsize=(10, 6))
-    _plot_split(ax, split_points, split, x_key, x_label, color_by_dim, linestyle_by_context)
-    _add_style_legends(ax, color_by_dim, linestyle_by_context)
+    _plot_split(
+        ax,
+        split_points,
+        split,
+        x_key,
+        x_label,
+        color_by_dim,
+        marker_by_context,
+        ema_alpha,
+        ema_unbiased,
+    )
+    _add_style_legends(ax, color_by_dim, marker_by_context)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -288,6 +363,8 @@ def plot_single_curve(points, split, x_key, x_label, path):
 
 def main():
     args = parse_args()
+    if args.ema_alpha < 0 or args.ema_alpha > 1:
+        raise SystemExit("--ema-alpha must be between 0 and 1.")
     args.log_root = args.log_root.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -300,23 +377,16 @@ def main():
     print(f"Wrote {csv_path}")
 
     if args.series == "train_test":
-        outputs = [
-            ("Train w/ Grad", "train", "log10_tokens", "log10 training tokens"),
-            ("Train w/ Grad", "train", "log10_compute", "log10 analytical training FLOPs"),
-            ("Test", "test", "log10_tokens", "log10 training tokens"),
-            ("Test", "test", "log10_compute", "log10 analytical training FLOPs"),
-        ]
-        for split, label, x_key, x_label in outputs:
-            path = args.out_dir / f"{label}_loss_vs_{x_key.replace('log10_', 'log_')}.png"
-            if plot_single_curve(points, split, x_key, x_label, path):
-                print(f"Wrote {path}")
+        for split, label in [("Train w/ Grad", "train"), ("Test", "test")]:
+            for x_key, x_label in X_AXES:
+                path = args.out_dir / f"{label}_loss_vs_{x_key.replace('log10_', 'log_')}.png"
+                if plot_single_curve(points, split, x_key, x_label, path, args.ema_alpha, args.ema_unbiased):
+                    print(f"Wrote {path}")
     else:
-        tokens_plot = args.out_dir / f"{args.series}_loss_vs_log_tokens.png"
-        compute_plot = args.out_dir / f"{args.series}_loss_vs_log_compute.png"
-        plot_points(points, "log10_tokens", "log10 training tokens", tokens_plot)
-        plot_points(points, "log10_compute", "log10 analytical training FLOPs", compute_plot)
-        print(f"Wrote {tokens_plot}")
-        print(f"Wrote {compute_plot}")
+        for x_key, x_label in X_AXES:
+            path = args.out_dir / f"{args.series}_loss_vs_{x_key.replace('log10_', 'log_')}.png"
+            plot_points(points, x_key, x_label, path, args.ema_alpha, args.ema_unbiased)
+            print(f"Wrote {path}")
 
 
 if __name__ == "__main__":
