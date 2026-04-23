@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument(
         "--min-step",
         type=int,
-        default=100,
+        default=500,
         help="Drop loss points before this training step. Use 1 to remove initialization anchors.",
     )
     return parser.parse_args()
