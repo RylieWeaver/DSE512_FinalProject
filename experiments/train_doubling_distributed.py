@@ -65,7 +65,7 @@ if __name__ == "__main__":
     log_every = 1
     eval_every = 10
     save_every = 1
-    num_heads = 12
+    num_heads = 8
     num_layers = 24
     output_dim = 1
     batches_per_step = 16
@@ -89,9 +89,12 @@ if __name__ == "__main__":
     val_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_val.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
     test_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_test.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
     collator = SequenceRegressionCollator(tokenizer=tokenizer, max_pad_length=context_len, parallel_state=parallel_state)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=collator, num_workers=4, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collator, num_workers=4)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, collate_fn=collator, num_workers=4)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=parallel_state.dp_size, rank=parallel_state.dp_rank, shuffle=True, drop_last=False)
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=parallel_state.dp_size, rank=parallel_state.dp_rank, shuffle=False, drop_last=False)
+    test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=parallel_state.dp_size, rank=parallel_state.dp_rank, shuffle=False, drop_last=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=collator, num_workers=4, sampler=train_sampler)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collator, num_workers=4, sampler=val_sampler)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, collate_fn=collator, num_workers=4, sampler=test_sampler)
 
     # Train from scratch
     if not finetune_from and not resume_from:

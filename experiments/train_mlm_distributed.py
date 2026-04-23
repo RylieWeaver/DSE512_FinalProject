@@ -30,7 +30,8 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str, default=Path(__file__).parent / "log", help="Directory to save logs and checkpoints to")
     parser.add_argument("--context_len", type=int, default=2048, help="Context length for model")
     parser.add_argument("--model_dim", type=int, default=1536, help="Model dimension")
-    parser.add_argument("--steps", type=int, default=1000000, help="Number of training steps")
+    parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
+    parser.add_argument("--end_step", type=int, default=None, help="Step to end training")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size per GPU")
     parser.add_argument("--batches_per_step", type=int, default=1, help="Number of batches to accumulate gradients for before stepping optimizer")
     parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
@@ -51,6 +52,7 @@ if __name__ == "__main__":
     context_len = args.context_len
     model_dim = args.model_dim
     steps = args.steps
+    end_step = args.end_step
     batch_size = args.batch_size
     batches_per_step = args.batches_per_step
     learning_rate = args.learning_rate
@@ -65,11 +67,11 @@ if __name__ == "__main__":
     master_addr = args.master_addr
     master_port = args.master_port
     ## Anything that I will keep constant
-    log_every = 1
-    eval_every = 1000
-    eval_batches = 10
-    save_every = 10000
-    num_heads = 12
+    log_every = 40
+    eval_every = 40
+    eval_batches = 40
+    save_every = 1000
+    num_heads = 8
     num_layers = 24
     decay_type = "cosine"
     decay_steps = (steps - warmup_steps)
@@ -173,4 +175,4 @@ if __name__ == "__main__":
     trainer.set_loaders(train_loader, val_loader, test_loader)
     rank0_print(f"Number of Model Parameters: {sum(p.numel() for p in trainer.model.parameters())}")
     trainer.model = DDP(trainer.model, process_group=parallel_state.world_group, device_ids=[parallel_state.local_rank])
-    trainer.train(steps=steps)
+    trainer.train(steps=steps, end_step=end_step)

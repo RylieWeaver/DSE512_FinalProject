@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Plot loss against log training tokens and analytical transformer compute."""
+
+import argparse
+import csv
+import math
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+
+RUN_RE = re.compile(
+    r"md(?P<model_dim>\d+)_ctx(?P<context_len>\d+)"
+    r"(?:_bs(?P<batch_size>\d+))?"
+    r"_bps(?P<batches_per_step>\d+)"
+    r"(?:_sp(?P<sp_size>\d+)_dp(?P<dp_size>\d+))?$"
+)
+LOG_RE = re.compile(
+    r"\[Step\]\s+(?P<step>\d+):\s+"
+    r"(?P<split>Train w/o Grad|Train w/ Grad|Eval|Test)\s+"
+    r"Loss:\s+(?P<loss>[0-9.]+)"
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot scaling-law traces from experiments/log/<run>/log.txt."
+    )
+    parser.add_argument("--log-root", type=Path, default=Path("log"))
+    parser.add_argument("--out-dir", type=Path, default=Path("plots"))
+    parser.add_argument(
+        "--series",
+        choices=["train", "eval", "test", "train_test"],
+        default="train_test",
+        help="Loss series to plot. train_test writes separate train and test curve plots.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Fallback per-GPU microbatch size for old run names without _bs... in them.",
+    )
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=64,
+        help="Fallback data parallel size for old run names without _dp... in them.",
+    )
+    parser.add_argument(
+        "--sp-size",
+        type=int,
+        default=1,
+        help="Fallback sequence parallel size for old run names without _sp... in them.",
+    )
+    parser.add_argument("--num-layers", type=int, default=24)
+    parser.add_argument("--vocab-size", type=int, default=6)
+    parser.add_argument("--max-loss", type=float, default=None, help="Optional y-axis filter.")
+    parser.add_argument(
+        "--min-step",
+        type=int,
+        default=600,
+        help="Drop loss points before this training step. Use 1 to remove initialization anchors.",
+    )
+    return parser.parse_args()
+
+
+def parse_run_name(run_dir):
+    match = RUN_RE.match(run_dir.name)
+    if match is None:
+        return None
+    return {
+        key: int(value) if value is not None else None
+        for key, value in match.groupdict().items()
+    }
+
+
+def parse_log(log_path):
+    rows = []
+    with log_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            match = LOG_RE.search(line)
+            if match is None:
+                continue
+            rows.append(
+                {
+                    "step": int(match.group("step")),
+                    "split": match.group("split"),
+                    "loss": float(match.group("loss")),
+                }
+            )
+    return rows
+
+
+def forward_flops_per_sample(context_len, model_dim, num_layers, vocab_size):
+    """Analytical dense pre-norm transformer forward FLOPs for one sequence.
+
+    Per layer, this counts:
+    - QKV projection: 6 * S * D^2
+    - attention output projection: 2 * S * D^2
+    - two-layer 4D MLP: 16 * S * D^2
+    - full non-causal attention QK and AV matmuls: 4 * S^2 * D
+
+    LayerNorm, RoPE, activation, softmax, dropout, and communication are ignored.
+    Training compute uses 3x forward FLOPs as a standard forward+backward estimate.
+    """
+    s = context_len
+    d = model_dim
+    transformer = num_layers * (24 * s * d * d + 4 * s * s * d)
+    unembed = 2 * s * d * vocab_size
+    return transformer + unembed
+
+
+def build_points(args):
+    split_names = {
+        "train": {"Train w/ Grad"},
+        "eval": {"Eval"},
+        "test": {"Test"},
+        "train_test": {"Train w/ Grad", "Test"},
+    }[args.series]
+
+    points = []
+    for log_path in sorted(args.log_root.glob("*/log.txt")):
+        run_dir = log_path.parent
+        run = parse_run_name(run_dir)
+        if run is None:
+            continue
+        batch_size = run["batch_size"] if run["batch_size"] is not None else args.batch_size
+        dp_size = run["dp_size"] if run["dp_size"] is not None else args.dp_size
+        sp_size = run["sp_size"] if run["sp_size"] is not None else args.sp_size
+
+        tokens_per_step = (
+            run["context_len"]
+            * batch_size
+            * run["batches_per_step"]
+            * dp_size
+        )
+        train_flops_per_step = (
+            3
+            * forward_flops_per_sample(
+                context_len=run["context_len"],
+                model_dim=run["model_dim"],
+                num_layers=args.num_layers,
+                vocab_size=args.vocab_size,
+            )
+            * batch_size
+            * run["batches_per_step"]
+            * dp_size
+        )
+
+        for row in parse_log(log_path):
+            if row["split"] not in split_names:
+                continue
+            if row["step"] < args.min_step:
+                continue
+            if args.max_loss is not None and row["loss"] > args.max_loss:
+                continue
+
+            # Step 0 eval/test losses are useful curve anchors, but log axes cannot
+            # represent zero tokens/compute. Plot them at the first-step position.
+            plot_step = max(row["step"], 1)
+            tokens = plot_step * tokens_per_step
+            compute = plot_step * train_flops_per_step
+            points.append(
+                {
+                    **run,
+                    "batch_size": batch_size,
+                    "dp_size": dp_size,
+                    "sp_size": sp_size,
+                    "run_name": run_dir.name,
+                    "step": row["step"],
+                    "split": row["split"],
+                    "loss": row["loss"],
+                    "tokens": tokens,
+                    "compute_flops": compute,
+                    "log10_tokens": math.log10(tokens),
+                    "log10_compute": math.log10(compute),
+                }
+            )
+    return points
+
+
+def write_csv(points, path):
+    if not points:
+        return
+    fieldnames = list(points[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(points)
+
+
+def _style_maps(points):
+    model_dims = sorted({point["model_dim"] for point in points})
+    context_lens = sorted({point["context_len"] for point in points})
+
+    cmap = plt.get_cmap("tab10")
+    color_by_dim = {
+        model_dim: cmap(idx % cmap.N)
+        for idx, model_dim in enumerate(model_dims)
+    }
+    linestyles = ["-", "--", ":", "-.", (0, (5, 2, 1, 2, 1, 2)), (0, (3, 1, 1, 1))]
+    linestyle_by_context = {
+        context_len: linestyles[idx % len(linestyles)]
+        for idx, context_len in enumerate(context_lens)
+    }
+    return color_by_dim, linestyle_by_context
+
+
+def _add_style_legends(ax, color_by_dim, linestyle_by_context):
+    dim_handles = [
+        Line2D([0], [0], color=color, lw=2, label=f"dim {model_dim}")
+        for model_dim, color in color_by_dim.items()
+    ]
+    context_handles = [
+        Line2D([0], [0], color="0.25", lw=2, linestyle=linestyle, label=f"ctx {context_len}")
+        for context_len, linestyle in linestyle_by_context.items()
+    ]
+
+    dim_legend = ax.legend(handles=dim_handles, title="Model dim", fontsize=7, title_fontsize=8, loc="upper right")
+    ax.add_artist(dim_legend)
+    ax.legend(handles=context_handles, title="Context length", fontsize=7, title_fontsize=8, loc="lower left")
+
+
+def _plot_split(ax, points, split, x_key, x_label, color_by_dim, linestyle_by_context):
+    grouped = {}
+    for point in points:
+        if point["split"] != split:
+            continue
+        grouped.setdefault(point["run_name"], []).append(point)
+
+    for run_name, run_points in grouped.items():
+        run_points = sorted(run_points, key=lambda point: point["step"])
+        first = run_points[0]
+        ax.plot(
+            [point[x_key] for point in run_points],
+            [point["loss"] for point in run_points],
+            color=color_by_dim[first["model_dim"]],
+            linestyle=linestyle_by_context[first["context_len"]],
+            marker="o",
+            markersize=2.5 if split == "Train w/ Grad" else 3.5,
+            linewidth=1.2,
+            alpha=0.9,
+        )
+
+    ax.set_title(split)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Loss")
+    ax.grid(True, alpha=0.3)
+
+
+def plot_points(points, x_key, x_label, path):
+    splits = [split for split in ["Train w/ Grad", "Test", "Eval", "Train w/o Grad"] if any(point["split"] == split for point in points)]
+    color_by_dim, linestyle_by_context = _style_maps(points)
+
+    fig, axes = plt.subplots(
+        len(splits),
+        1,
+        figsize=(10, 4.5 * len(splits)),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for ax, split in zip(axes[:, 0], splits):
+        _plot_split(ax, points, split, x_key, x_label, color_by_dim, linestyle_by_context)
+
+    _add_style_legends(axes[0, 0], color_by_dim, linestyle_by_context)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def plot_single_curve(points, split, x_key, x_label, path):
+    split_points = [point for point in points if point["split"] == split]
+    if not split_points:
+        return False
+
+    color_by_dim, linestyle_by_context = _style_maps(points)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    _plot_split(ax, split_points, split, x_key, x_label, color_by_dim, linestyle_by_context)
+    _add_style_legends(ax, color_by_dim, linestyle_by_context)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    return True
+
+
+def main():
+    args = parse_args()
+    args.log_root = args.log_root.resolve()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    points = build_points(args)
+    if not points:
+        raise SystemExit(f"No {args.series} loss points found under {args.log_root}")
+
+    csv_path = args.out_dir / f"{args.series}_scaling_points.csv"
+    write_csv(points, csv_path)
+    print(f"Wrote {csv_path}")
+
+    if args.series == "train_test":
+        outputs = [
+            ("Train w/ Grad", "train", "log10_tokens", "log10 training tokens"),
+            ("Train w/ Grad", "train", "log10_compute", "log10 analytical training FLOPs"),
+            ("Test", "test", "log10_tokens", "log10 training tokens"),
+            ("Test", "test", "log10_compute", "log10 analytical training FLOPs"),
+        ]
+        for split, label, x_key, x_label in outputs:
+            path = args.out_dir / f"{label}_loss_vs_{x_key.replace('log10_', 'log_')}.png"
+            if plot_single_curve(points, split, x_key, x_label, path):
+                print(f"Wrote {path}")
+    else:
+        tokens_plot = args.out_dir / f"{args.series}_loss_vs_log_tokens.png"
+        compute_plot = args.out_dir / f"{args.series}_loss_vs_log_compute.png"
+        plot_points(points, "log10_tokens", "log10 training tokens", tokens_plot)
+        plot_points(points, "log10_compute", "log10 analytical training FLOPs", compute_plot)
+        print(f"Wrote {tokens_plot}")
+        print(f"Wrote {compute_plot}")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,14 +7,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-try:
-    from flash_attn import flash_attn_func
-except ImportError:
-    flash_attn_func = None
 
 # DSE 512
-from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter, _F_Mean_B_ReduceScatter
+from dse.distributed import ParallelState, _F_Gather_B_ReduceScatter, _F_Mean_B_ReduceScatter, rank0_print
 from dse.utils.config import Config
+
+# Optional
+try:
+    from flash_attn import flash_attn_func
+    rank0_print("Flash Attention imported successfully.")
+except ImportError:
+    flash_attn_func = None
 
 
 

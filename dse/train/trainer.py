@@ -262,9 +262,10 @@ class MLMTrainer:
         self._run_single_eval(self.val_loader, self.descriptors[2])    # Eval
         self._run_single_eval(self.test_loader, self.descriptors[3])   # Test
 
-    def train(self, steps=10000):
+    def train(self, steps=10000, end_step=None):
         # Setup
-        end_step = self.last_step + steps
+        if end_step is None:
+            end_step = self.last_step + steps
 
         # Initial evaluation before training
         if self.last_step == 0:
@@ -600,7 +601,10 @@ class SequenceRegressionTrainer:
         self._run_single_eval(self.test_loader, self.descriptors[3])   # Test
 
     def _train_epoch(self):
+        # Setup
         total_loss, total_count = 0.0, 0
+        if hasattr(self.train_loader.sampler, "set_epoch"):
+            self.train_loader.sampler.set_epoch(self.last_epoch)
         self.optimizer.zero_grad(set_to_none=True)
         for batch_idx, (inputs, labels) in enumerate(
             tqdm(
@@ -635,9 +639,10 @@ class SequenceRegressionTrainer:
                 self.scheduler.step()
         return total_loss, total_count
 
-    def train(self, epochs=100):
+    def train(self, epochs=100, end_epoch=None):
         # Setup
-        end_epoch = self.last_epoch + epochs
+        if end_epoch is None:
+            end_epoch = self.last_epoch + epochs
 
         # Initial evaluation before training
         if self.last_epoch == 0:
@@ -684,6 +689,9 @@ class SequenceRegressionTrainer:
         save_dir = self.cfg.checkpoint_dir / ckpt_dir
 
         # Save (only on rank 0)
+        ## NOTE: Sandwiching with barriers prevents timeout due to rank0 taking a long time to save
+        if dist.is_initialized():
+            dist.barrier()
         if is_rank0():
             save_dir.mkdir(parents=True, exist_ok=True)
             # Model
@@ -695,6 +703,8 @@ class SequenceRegressionTrainer:
             # Optimizer / scheduler
             torch.save(self.optimizer.state_dict(), save_dir / "optimizer.pt")
             torch.save(self.scheduler.state_dict(), save_dir / "scheduler.pt")
+        if dist.is_initialized():
+            dist.barrier()
 
     @staticmethod
     def load_checkpoint(dir: Union[Path, str], device: torch.device, parallel_state: ParallelState = None) -> "SequenceRegressionTrainer":

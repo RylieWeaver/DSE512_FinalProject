@@ -1,24 +1,42 @@
 #!/bin/bash
 #SBATCH -A LRN036
 #SBATCH -J DSE512_Scaling_Laws
-#SBATCH -o log/ddp-%j.o
-#SBATCH -e log/ddp-%j.e
+#SBATCH -o log/%j/slurm.o
+#SBATCH -e log/%j/slurm.e
 #SBATCH -t 02:00:00
 #SBATCH -p batch
 ##SBATCH -q debug
-#SBATCH -N 2
+#SBATCH -N 32
 
+# Pipe erros and disable core dumps
 set -euo pipefail
+ulimit -c 0
 
-if [[ $# -lt 3 ]]; then
-    echo "Usage: sbatch frontier_scaling_laws.sh <model_dim> <context_len> <batches_per_step>"
+if [[ $# -lt 6 ]]; then
+    echo "Usage: sbatch frontier_scaling_laws.sh <model_dim> <context_len> <batch_size> <batches_per_step> <sp_size> <dp_size>"
     exit 1
 fi
 
 # Read args
 MODEL_DIM="$1"
 CONTEXT_LEN="$2"
-BATCHES_PER_STEP="$3"
+BATCH_SIZE="$3"
+BATCHES_PER_STEP="$4"
+SP_SIZE="$5"
+DP_SIZE="$6"
+
+# World Configuration
+export SLURM_NNODES="${SLURM_NNODES}"
+export NGPUS_PER_NODE=8
+export WORLD_SIZE=$((SLURM_NNODES * NGPUS_PER_NODE))
+GPUS_PER_TASK=1
+NTASKS=$((WORLD_SIZE / GPUS_PER_TASK))
+
+# Check world size = SP_SIZE * DP_SIZE
+if [[ $((SP_SIZE * DP_SIZE)) -ne $WORLD_SIZE ]]; then
+    echo "Error: SP_SIZE * DP_SIZE must equal WORLD_SIZE (${SP_SIZE} * ${DP_SIZE} != ${WORLD_SIZE})"
+    exit 1
+fi
 
 # Base paths (default to environment)
 ENV_DIR="${ENV_DIR:-<path-to-env>}"
@@ -28,7 +46,7 @@ CKPT_ROOT="${CKPT_ROOT:-<path-to-checkpoints>}"
 LOG_ROOT="${REPO_DIR}/experiments/log"
 
 # Run-specific paths
-RUN_NAME="md${MODEL_DIM}_ctx${CONTEXT_LEN}_bps${BATCHES_PER_STEP}"
+RUN_NAME="md${MODEL_DIM}_ctx${CONTEXT_LEN}_bs${BATCH_SIZE}_bps${BATCHES_PER_STEP}_sp${SP_SIZE}_dp${DP_SIZE}"
 CKPT_DIR="${CKPT_ROOT}/${RUN_NAME}"
 LOG_DIR="${LOG_ROOT}/${RUN_NAME}"
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}"
@@ -38,7 +56,10 @@ echo "Time: $(date)"
 echo "RUN_NAME=${RUN_NAME}"
 echo "MODEL_DIM=${MODEL_DIM}"
 echo "CONTEXT_LEN=${CONTEXT_LEN}"
+echo "BATCH_SIZE=${BATCH_SIZE}"
 echo "BATCHES_PER_STEP=${BATCHES_PER_STEP}"
+echo "SP_SIZE=${SP_SIZE}"
+echo "DP_SIZE=${DP_SIZE}"
 
 # Modules
 module load PrgEnv-gnu/8.6.0
@@ -47,7 +68,9 @@ module load craype-accel-amd-gfx90a
 
 # Activate Environment
 source "${ENV_DIR}/bin/activate"
-export PYTHONPATH="${PYTHONPATH}:${REPO_DIR}"
+PYTHONPATH="${PYTHONPATH:-}:${REPO_DIR}"
+export PYTHONPATH
+
 
 # Distributed Env Vars
 export MASTER_ADDR
@@ -55,18 +78,16 @@ MASTER_ADDR="$(hostname -i)"
 export MASTER_PORT=3442
 export NCCL_SOCKET_IFNAME=hsn0
 
+# Apparently needed for triton to avoid parallel Create/Delete contention
+export TRITON_CACHE_DIR="/tmp/triton-cache-${SLURM_JOB_ID}-${SLURM_PROCID}"
+rm -r -f "${TRITON_CACHE_DIR}"
+mkdir -p "${TRITON_CACHE_DIR}"
+
 # Needed to bypass MIOpen disk I/O errors
 export MIOPEN_USER_DB_PATH="/tmp/my-miopen-cache"
 export MIOPEN_CUSTOM_CACHE_DIR="${MIOPEN_USER_DB_PATH}"
 rm -rf "${MIOPEN_USER_DB_PATH}"
 mkdir -p "${MIOPEN_USER_DB_PATH}"
-
-# World Configuration
-export SLURM_NNODES="${SLURM_NNODES}"
-export NGPUS_PER_NODE=8
-export WORLD_SIZE=$((SLURM_NNODES * NGPUS_PER_NODE))
-GPUS_PER_TASK=1
-NTASKS=$((WORLD_SIZE / GPUS_PER_TASK))
 
 # Proxies
 export all_proxy=socks://proxy.ccs.ornl.gov:3128/
@@ -80,12 +101,9 @@ export OMP_NUM_THREADS=1
 # export NCCL_DEBUG=INFO
 
 # Experiment mesh constants
-SP_SIZE=8
-DP_SIZE=$((WORLD_SIZE / SP_SIZE))
-LEARNING_RATE=6e-5
-BATCH_SIZE=1
-STEPS=10000
-WARMUP_STEPS=1000
+LEARNING_RATE=1e-5
+STEPS=5000
+WARMUP_STEPS=500
 
 # Run experiment
 cd "${REPO_DIR}/experiments"

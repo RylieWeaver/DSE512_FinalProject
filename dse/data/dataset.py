@@ -17,7 +17,6 @@ from .tokenizer import BPTokenizer
 from .utils import move_to, pad
 
 
-
 def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob=0.0, keep_prob=0.0):
     """
     A lot of logic here is made to make sure we don't mask/predict 'N' tokens since they aren't informative.
@@ -73,6 +72,15 @@ def bert_mlm_mask(input_ids, tokenizer=None, prob=0.15, mask_prob=0.0, rand_prob
         rand_choices = options[torch.randint(0, len(options), input_ids.shape, device=device)]
         input_ids[to_rand] = rand_choices[to_rand]
     return input_ids, labels
+
+
+def round_pad_length(num, multiple, name):
+    rounded = ((num + multiple - 1) // multiple) * multiple
+    if rounded != num:
+        warnings.warn(
+            f"Rounding {name} from {num} to {rounded} so it is divisible by pad multiple {multiple}."
+        )
+    return rounded
 
 
 ####################################################################
@@ -169,16 +177,27 @@ def mlm_collate_batch(batch, tokenizer, min_pad_length, max_pad_length=None):
 
 
 class MLMCollator:
-    def __init__(self, tokenizer=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
+    def __init__(self, tokenizer=None, min_pad_multiple=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
         self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
+        if min_pad_multiple is not None:
+            self.min_pad_multiple = min_pad_multiple
+        elif parallel_state is not None:
+            self.min_pad_multiple = parallel_state.sp_size
+        else:
+            self.min_pad_multiple = 1
+        min_pad_length = max(min_pad_length, self.min_pad_multiple)
+        self.min_pad_length = round_pad_length(min_pad_length, self.min_pad_multiple, "min_pad_length")
+        self.max_pad_length = (
+            round_pad_length(max_pad_length, self.min_pad_multiple, "max_pad_length")
+            if max_pad_length is not None
+            else None
+        )
         self.parallel_state = parallel_state if parallel_state else ParallelState()
-        self.min_pad_length = max(min_pad_length, self.parallel_state.sp_size)
-        self.max_pad_length = max_pad_length
     def __call__(self, batch):
         if self.parallel_state.sp_size == 1 or is_rank0(self.parallel_state.sp_group):
             max_L = max(len(item["token_ids"]) for item in batch)
             min_pad_length = max(self.min_pad_length, max_L)
-            min_pad_length = max(min_pad_length, self.parallel_state.sp_size)  # ensure divisible by sp_size
+            min_pad_length = ((min_pad_length + self.min_pad_multiple - 1) // self.min_pad_multiple) * self.min_pad_multiple
             input_ids, labels = mlm_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length, max_pad_length=self.max_pad_length)
         else:
             input_ids = None
@@ -361,16 +380,27 @@ def sequence_regression_collate_batch(batch, tokenizer, min_pad_length, max_pad_
 
 
 class SequenceRegressionCollator:
-    def __init__(self, tokenizer=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
+    def __init__(self, tokenizer=None, min_pad_multiple=None, min_pad_length=2, max_pad_length=None, parallel_state=None):
         self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
+        if min_pad_multiple is not None:
+            self.min_pad_multiple = min_pad_multiple
+        elif parallel_state is not None:
+            self.min_pad_multiple = parallel_state.sp_size
+        else:
+            self.min_pad_multiple = 1
+        min_pad_length = max(min_pad_length, self.min_pad_multiple)
+        self.min_pad_length = round_pad_length(min_pad_length, self.min_pad_multiple, "min_pad_length")
+        self.max_pad_length = (
+            round_pad_length(max_pad_length, self.min_pad_multiple, "max_pad_length")
+            if max_pad_length is not None
+            else None
+        )
         self.parallel_state = parallel_state if parallel_state else ParallelState()
-        self.min_pad_length = max(min_pad_length, self.parallel_state.sp_size)
-        self.max_pad_length = max_pad_length
     def __call__(self, batch):
         if self.parallel_state.sp_size == 1 or is_rank0(self.parallel_state.sp_group):
             max_L = max(len(item["token_ids"]) for item in batch)
             min_pad_length = max(self.min_pad_length, max_L)
-            min_pad_length = max(min_pad_length, self.parallel_state.sp_size)  # ensure divisible by sp_size
+            min_pad_length = ((min_pad_length + self.min_pad_multiple - 1) // self.min_pad_multiple) * self.min_pad_multiple
             input_ids, labels = sequence_regression_collate_batch(batch, self.tokenizer, min_pad_length=min_pad_length, max_pad_length=self.max_pad_length)
         else:
             input_ids = None
