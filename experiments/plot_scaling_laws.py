@@ -277,9 +277,16 @@ def _format_num_parameters(num_parameters):
     return str(num_parameters)
 
 
-def _add_style_legends(ax, color_by_params, marker_by_context):
+def _add_style_legends(ax, color_by_params, marker_by_context, metric_key):
+    if metric_key == "accuracy":
+        param_loc = "upper left"
+        context_loc = "lower right"
+    else:
+        param_loc = "upper right"
+        context_loc = "lower left"
+
     param_handles = [
-        Line2D([0], [0], color=color, lw=2, label=_format_num_parameters(num_parameters))
+        Line2D([0], [0], color=color, lw=3, label=_format_num_parameters(num_parameters))
         for num_parameters, color in color_by_params.items()
     ]
     context_handles = [
@@ -287,18 +294,30 @@ def _add_style_legends(ax, color_by_params, marker_by_context):
             [0],
             [0],
             color="0.25",
-            lw=1.2,
+            lw=2.0,
             linestyle="-",
             marker=marker,
-            markersize=5,
+            markersize=8,
             label=f"ctx {context_len}",
         )
         for context_len, marker in marker_by_context.items()
     ]
 
-    param_legend = ax.legend(handles=param_handles, title="Model parameters", fontsize=7, title_fontsize=8, loc="upper right")
+    param_legend = ax.legend(
+        handles=param_handles,
+        title="Model parameters",
+        fontsize=11,
+        title_fontsize=12,
+        loc=param_loc,
+    )
     ax.add_artist(param_legend)
-    ax.legend(handles=context_handles, title="Context length", fontsize=7, title_fontsize=8, loc="lower left")
+    ax.legend(
+        handles=context_handles,
+        title="Context length",
+        fontsize=11,
+        title_fontsize=12,
+        loc=context_loc,
+    )
 
 
 def apply_ema(values, alpha, unbiased=False):
@@ -402,7 +421,7 @@ def plot_points(points, x_key, x_label, metric_key, metric_label, path, ema_alph
             ema_unbiased,
         )
 
-    _add_style_legends(axes[0, 0], color_by_params, marker_by_context)
+    _add_style_legends(axes[0, 0], color_by_params, marker_by_context, metric_key)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -433,7 +452,7 @@ def plot_single_curve(points, split, x_key, x_label, metric_key, metric_label, p
         ema_alpha,
         ema_unbiased,
     )
-    _add_style_legends(ax, color_by_params, marker_by_context)
+    _add_style_legends(ax, color_by_params, marker_by_context, metric_key)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
