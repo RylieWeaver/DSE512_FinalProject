@@ -120,4 +120,4 @@ srun -N "${SLURM_NNODES}" --ntasks-per-node "${NGPUS_PER_NODE}" -c 7 --gpus-per-
     --sequence_parallel_size "${SP_SIZE}" \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \
-    --resume_from "${CKPT_DIR}/step_7600" \
+    --resume_from "${CKPT_DIR}/step_7800" \
