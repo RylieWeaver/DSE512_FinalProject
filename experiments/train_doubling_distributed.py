@@ -16,7 +16,10 @@ from dse.distributed import resolve_device, rank0_print, init_parallel_state
 
 
 # Commands:
-# - python train_regression.py --context_len 80000 --model_dim 1536
+# - python train_doubling_distributed.py --context_len 80000 --model_dim 1536
+# - torchrun --standalone --nproc_per_node=4 train_doubling_distributed.py  --data_parallel_size 1 --sequence_parallel_size 4 --finetune_from /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/frontier
+# - nohup torchrun --standalone --nproc_per_node=4 train_doubling_distributed.py  --data_parallel_size 1 --sequence_parallel_size 4 --finetune_from /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/frontier > output.txt 2>&1 &
+# - pkill -u "$(whoami)" -f 'train_doubling_distributed.py'
 # - NOTE: The model can take hundreds of epochs to converge, even with few parameters and context length.
 
 
@@ -29,7 +32,7 @@ if __name__ == "__main__":
     parser.add_argument("--context_len", type=int, default=80000, help="Context length for model")
     parser.add_argument("--model_dim", type=int, default=1536, help="Model dimension")
     parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=3e-6, help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of linear warmup steps")
     parser.add_argument("--embed_dropout", type=float, default=0.05, help="Embedding dropout")
     parser.add_argument("--attn_dropout", type=float, default=0.05, help="Attention dropout")
@@ -63,7 +66,7 @@ if __name__ == "__main__":
     master_port = args.master_port
     ## Anything that I will keep constant
     log_every = 1
-    eval_every = 10
+    eval_every = 1
     save_every = 1
     num_heads = 8
     num_layers = 24
