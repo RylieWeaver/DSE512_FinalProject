@@ -29,6 +29,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="/home/r9w/Scratch/Distributed/DSE/DSE512_FinalProject/dse/data/ribosomal", help="Directory for data")
     parser.add_argument("--ckpt_dir", type=str, default="/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/doubling", help="Directory for checkpoints")
+    parser.add_argument("--log_dir", type=str, default="/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/doubling/log", help="Directory for logs")
     parser.add_argument("--context_len", type=int, default=80000, help="Context length for model")
     parser.add_argument("--model_dim", type=int, default=1536, help="Model dimension")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
@@ -50,6 +51,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     data_dir = Path(args.data_dir).resolve()
     ckpt_dir = Path(args.ckpt_dir).resolve()
+    log_dir = Path(args.log_dir).resolve()
     context_len = args.context_len
     model_dim = args.model_dim
     epochs = args.epochs
@@ -75,7 +77,7 @@ if __name__ == "__main__":
     num_heads = 8
     num_layers = 24
     output_dim = 1
-    batches_per_step = 32
+    batches_per_step = 1
     decay_type = "cosine"
     decay_steps = 19 * warmup_steps
     amp_dtype = "bfloat16"
@@ -123,6 +125,7 @@ if __name__ == "__main__":
         ## Trainer configuration
         trainer_cfg = SequenceRegressionTrainerConfig(
             log_every=log_every,
+            log_dir=log_dir,
             eval_every=eval_every,
             batches_per_step=batches_per_step,
             warmup_steps=warmup_steps,
@@ -171,6 +174,7 @@ if __name__ == "__main__":
         model.backbone.load_state_dict(backbone_state_dict, strict=True)
         trainer_cfg = SequenceRegressionTrainerConfig(
             log_every=log_every,
+            log_dir=log_dir,
             eval_every=eval_every,
             batches_per_step=batches_per_step,
             warmup_steps=warmup_steps,

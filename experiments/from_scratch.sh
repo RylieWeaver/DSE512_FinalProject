@@ -1,25 +1,18 @@
 #!/bin/bash
 #SBATCH -A LRN036
-#SBATCH -J Pretraining
-#SBATCH -o pretraining_log/%j/slurm.o
-#SBATCH -e pretraining_log/%j/slurm.e
+#SBATCH -J FromScratch
+#SBATCH -o from_scratch_log/%j/slurm.o
+#SBATCH -e from_scratch_log/%j/slurm.e
 #SBATCH -t 02:00:00
 #SBATCH -p batch
 ##SBATCH -q debug
 #SBATCH -N 32
 
+# salloc -A LRN036 -t 02:00:00 -q debug -N 1
+
 # Pipe erros and disable core dumps
 set -euo pipefail
 ulimit -c 0
-
-# Read args
-MODEL_DIM=1536
-CHUNK_SIZE=80000
-CONTEXT_LEN=80000
-BATCH_SIZE=1
-BATCHES_PER_STEP=1
-SP_SIZE=8
-DP_SIZE=32
 
 # World Configuration
 export SLURM_NNODES="${SLURM_NNODES}"
@@ -27,6 +20,8 @@ export NGPUS_PER_NODE=8
 export WORLD_SIZE=$((SLURM_NNODES * NGPUS_PER_NODE))
 GPUS_PER_TASK=1
 NTASKS=$((WORLD_SIZE / GPUS_PER_TASK))
+DP_SIZE=32
+SP_SIZE=8
 
 # Check world size = SP_SIZE * DP_SIZE
 if [[ $((SP_SIZE * DP_SIZE)) -ne $WORLD_SIZE ]]; then
@@ -36,26 +31,11 @@ fi
 
 # Base paths (default to environment)
 export ENV_DIR="/lustre/orion/lrn036/world-shared/rylieweaver/Environments/DSE512/dse"
+source "${ENV_DIR}/bin/activate"
 export REPO_DIR="/ccs/home/rylieweaver/Scratch/DSE512_FinalProject"
-export DATA_DIR="/lustre/orion/lrn036/proj-shared/rylieweaver/Datasets/Microbial/reference"
-export CKPT_DIR="/lustre/orion/lrn036/proj-shared/rylieweaver/checkpoints/Microbial/Final_Pretrain"
-export LOG_ROOT="${REPO_DIR}/experiments/pretraining_log"
-
-# Run-specific paths
-RUN_NAME="md${MODEL_DIM}_ctx${CONTEXT_LEN}_bs${BATCH_SIZE}_bps${BATCHES_PER_STEP}_sp${SP_SIZE}_dp${DP_SIZE}"
-LOG_DIR="${LOG_ROOT}/${RUN_NAME}"
-mkdir -p "${CKPT_DIR}" "${LOG_DIR}"
-
-# Log experiment configuration
-echo "Time: $(date)"
-echo "RUN_NAME=${RUN_NAME}"
-echo "MODEL_DIM=${MODEL_DIM}"
-echo "CHUNK_SIZE=${CHUNK_SIZE}"
-echo "CONTEXT_LEN=${CONTEXT_LEN}"
-echo "BATCH_SIZE=${BATCH_SIZE}"
-echo "BATCHES_PER_STEP=${BATCHES_PER_STEP}"
-echo "SP_SIZE=${SP_SIZE}"
-echo "DP_SIZE=${DP_SIZE}"
+export DATA_DIR="${REPO_DIR}/dse/data/ribosomal/"
+export CKPT_DIR="/lustre/orion/lrn036/proj-shared/rylieweaver/checkpoints/Microbial/FromScratch/"
+export LOG_DIR="${REPO_DIR}/experiments/from_scratch_log"
 
 # Modules
 module load PrgEnv-gnu/8.6.0
@@ -96,29 +76,42 @@ export no_proxy='localhost,127.0.0.0/8,*.ccs.ornl.gov'
 export OMP_NUM_THREADS=1
 # export NCCL_DEBUG=INFO
 
-# Experiment mesh constants
-LEARNING_RATE=1e-5
-END_STEP=25000
-WARMUP_STEPS=3000
+# Hyperparameters
+CONTEXT_LEN=80000
+MODEL_DIM=1536
+EPOCHS=100
+BACKBONE_LEARNING_RATE=1e-7
+HEAD_LEARNING_RATE=1e-5
+WARMUP_STEPS=100
+EMBEDDING_DROPOUT=0.05
+# Attention dropout has to be zero for AMD Triton Flash-Attn kernels
+ATTENTION_DROPOUT=0.00
+RESIDUAL_DROPOUT=0.1
+HEAD_DROPOUT=0.2
+BACKBONE_WEIGHT_DECAY=0.0
+HEAD_WEIGHT_DECAY=1e-3
+
 
 # Run experiment
 cd "${REPO_DIR}/experiments"
 srun -N "${SLURM_NNODES}" --ntasks-per-node "${NGPUS_PER_NODE}" -c 7 --gpus-per-task="${GPUS_PER_TASK}" --gpu-bind=closest \
-    python3 -W ignore -u train_mlm_distributed.py \
+    python3 -W ignore -u train_doubling_distributed.py \
     --data_dir "${DATA_DIR}" \
     --ckpt_dir "${CKPT_DIR}" \
     --log_dir "${LOG_DIR}" \
-    --chunk_size "${CHUNK_SIZE}" \
     --context_len "${CONTEXT_LEN}" \
     --model_dim "${MODEL_DIM}" \
-    --learning_rate "${LEARNING_RATE}" \
-    --end_step "${END_STEP}" \
-    --batch_size "${BATCH_SIZE}" \
-    --batches_per_step "${BATCHES_PER_STEP}" \
+    --epochs "${EPOCHS}" \
+    --backbone_learning_rate "${BACKBONE_LEARNING_RATE}" \
+    --head_learning_rate "${HEAD_LEARNING_RATE}" \
     --warmup_steps "${WARMUP_STEPS}" \
+    --embed_dropout "${EMBEDDING_DROPOUT}" \
+    --attn_dropout "${ATTENTION_DROPOUT}" \
+    --resid_dropout "${RESIDUAL_DROPOUT}" \
+    --head_dropout "${HEAD_DROPOUT}" \
+    --backbone_weight_decay "${BACKBONE_WEIGHT_DECAY}" \
+    --head_weight_decay "${HEAD_WEIGHT_DECAY}" \
     --data_parallel_size "${DP_SIZE}" \
     --sequence_parallel_size "${SP_SIZE}" \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \
-
-# --resume_from "${CKPT_DIR}/*" \
