@@ -28,6 +28,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="/mnt/DGX01/Personal/r9w/Datasets/Microbial/reference", help="Directory for data")
     parser.add_argument("--ckpt_dir", type=str, default="/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/mlm", help="Directory for checkpoints")
     parser.add_argument("--log_dir", type=str, default=Path(__file__).parent / "log", help="Directory to save logs and checkpoints to")
+    parser.add_argument("--chunk_size", type=int, default=2048, help="Chunk size for FASTA dataset (should be <= context length)")
     parser.add_argument("--context_len", type=int, default=2048, help="Context length for model")
     parser.add_argument("--model_dim", type=int, default=1536, help="Model dimension")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
@@ -49,6 +50,7 @@ if __name__ == "__main__":
     data_dir = Path(args.data_dir).resolve()
     ckpt_dir = Path(args.ckpt_dir).resolve()
     log_dir = Path(args.log_dir).resolve()
+    chunk_size = args.chunk_size
     context_len = args.context_len
     model_dim = args.model_dim
     steps = args.steps
@@ -70,11 +72,11 @@ if __name__ == "__main__":
     log_every = 40
     eval_every = 40
     eval_batches = 40
-    save_every = 1000
+    save_every = 40
     num_heads = 8
     num_layers = 24
     decay_type = "cosine"
-    decay_steps = (steps - warmup_steps)
+    decay_steps = (end_step - warmup_steps) if end_step else (steps - warmup_steps)
     amp_dtype = "bfloat16"
     amp_enabled = True
 
@@ -89,9 +91,9 @@ if __name__ == "__main__":
 
     # Get datasets and loaders
     tokenizer = BPTokenizer()
-    train_dataset = FASTADataset(fasta_dir=(data_dir / "train"), chunk_size=context_len, tokenizer=tokenizer, parallel_state=parallel_state)
-    val_dataset = FASTADataset(fasta_dir=(data_dir / "val"), chunk_size=context_len, tokenizer=tokenizer, parallel_state=parallel_state)
-    test_dataset = FASTADataset(fasta_dir=(data_dir / "test"), chunk_size=context_len, tokenizer=tokenizer, parallel_state=parallel_state)
+    train_dataset = FASTADataset(fasta_dir=(data_dir / "train"), chunk_size=chunk_size, tokenizer=tokenizer, parallel_state=parallel_state)
+    val_dataset = FASTADataset(fasta_dir=(data_dir / "val"), chunk_size=chunk_size, tokenizer=tokenizer, parallel_state=parallel_state)
+    test_dataset = FASTADataset(fasta_dir=(data_dir / "test"), chunk_size=chunk_size, tokenizer=tokenizer, parallel_state=parallel_state)
     collator = MLMCollator(tokenizer=tokenizer, parallel_state=parallel_state)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collator, num_workers=4)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, collate_fn=collator, num_workers=4)
@@ -170,6 +172,15 @@ if __name__ == "__main__":
     else:
         ckpt_dir = ckpt_dir / resume_from
         trainer = MLMTrainer.load_checkpoint(ckpt_dir, device, parallel_state=parallel_state)
+        # Update logging args in case they were changed
+        trainer.cfg.save_every = save_every
+        trainer.save_every = save_every
+        trainer.cfg.log_every = log_every
+        trainer.log_every = log_every
+        trainer.cfg.eval_every = eval_every
+        trainer.eval_every = eval_every
+        trainer.cfg.eval_batches = eval_batches
+        trainer.eval_batches = eval_batches
 
     # Train the model
     trainer.set_loaders(train_loader, val_loader, test_loader)

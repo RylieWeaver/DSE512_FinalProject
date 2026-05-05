@@ -473,14 +473,6 @@ class DoublingTimeDataset(Dataset):
         df = df.reset_index(drop=True)
         return df
 
-    def get_std_norm_stats(self):
-        stats = {}
-        for target_col in self.target_cols:
-            mean = self.df[target_col].mean()
-            std = self.df[target_col].std()
-            stats[target_col] = {"mean": mean, "std": std}
-        return stats
-
     def __len__(self):
         return len(self.df)
 

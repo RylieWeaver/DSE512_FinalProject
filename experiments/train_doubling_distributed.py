@@ -16,7 +16,10 @@ from dse.distributed import resolve_device, rank0_print, init_parallel_state
 
 
 # Commands:
-# - python train_regression.py --context_len 80000 --model_dim 1536
+# - python train_doubling_distributed.py --context_len 80000 --model_dim 1536
+# - torchrun --standalone --nproc_per_node=4 train_doubling_distributed.py  --data_parallel_size 1 --sequence_parallel_size 4 --finetune_from /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/frontier
+# - nohup torchrun --standalone --nproc_per_node=4 train_doubling_distributed.py  --data_parallel_size 1 --sequence_parallel_size 4 --finetune_from /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/frontier > output.txt 2>&1 &
+# - pkill -u "$(whoami)" -f 'train_doubling_distributed.py'
 # - NOTE: The model can take hundreds of epochs to converge, even with few parameters and context length.
 
 
@@ -24,18 +27,21 @@ if __name__ == "__main__":
     # Setup
     ## Read args
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/mnt/DGX01/Personal/r9w/Datasets/Microbial/doubling", help="Directory for data")
+    parser.add_argument("--data_dir", type=str, default="/home/r9w/Scratch/Distributed/DSE/DSE512_FinalProject/dse/data/ribosomal", help="Directory for data")
     parser.add_argument("--ckpt_dir", type=str, default="/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/doubling", help="Directory for checkpoints")
+    parser.add_argument("--log_dir", type=str, default="/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/scratch/doubling/log", help="Directory for logs")
     parser.add_argument("--context_len", type=int, default=80000, help="Context length for model")
     parser.add_argument("--model_dim", type=int, default=1536, help="Model dimension")
-    parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Number of linear warmup steps")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--backbone_learning_rate", type=float, default=1e-7, help="Backbone learning rate")
+    parser.add_argument("--head_learning_rate", type=float, default=1e-5, help="Head learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of linear warmup steps")
     parser.add_argument("--embed_dropout", type=float, default=0.05, help="Embedding dropout")
     parser.add_argument("--attn_dropout", type=float, default=0.05, help="Attention dropout")
     parser.add_argument("--resid_dropout", type=float, default=0.1, help="Residual dropout")
     parser.add_argument("--head_dropout", type=float, default=0.2, help="Head dropout")
-    parser.add_argument("--weight_decay", type=float, default=1e-3, help="Weight decay")
+    parser.add_argument("--backbone_weight_decay", type=float, default=0.0, help="Backbone weight decay")
+    parser.add_argument("--head_weight_decay", type=float, default=1e-3, help="Head weight decay")
     parser.add_argument("--finetune_from", type=str, default=None, help="Directory to finetune from checkpoint")
     parser.add_argument("--resume_from", type=str, default=None, help="Directory to resume training from checkpoint")
     parser.add_argument("--data_parallel_size", type=int, default=1, help="Data parallel size")
@@ -45,16 +51,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     data_dir = Path(args.data_dir).resolve()
     ckpt_dir = Path(args.ckpt_dir).resolve()
+    log_dir = Path(args.log_dir).resolve()
     context_len = args.context_len
     model_dim = args.model_dim
     epochs = args.epochs
-    learning_rate = args.learning_rate
+    backbone_learning_rate = args.backbone_learning_rate
+    head_learning_rate = args.head_learning_rate
     warmup_steps = args.warmup_steps
     embed_dropout = args.embed_dropout
     attn_dropout = args.attn_dropout
     resid_dropout = args.resid_dropout
     head_dropout = args.head_dropout
-    weight_decay = args.weight_decay
+    backbone_weight_decay = args.backbone_weight_decay
+    head_weight_decay = args.head_weight_decay
     finetune_from = args.finetune_from
     resume_from = args.resume_from
     dp_size = args.data_parallel_size
@@ -63,14 +72,14 @@ if __name__ == "__main__":
     master_port = args.master_port
     ## Anything that I will keep constant
     log_every = 1
-    eval_every = 10
+    eval_every = 1
     save_every = 1
     num_heads = 8
     num_layers = 24
     output_dim = 1
-    batches_per_step = 16
+    batches_per_step = 1
     decay_type = "cosine"
-    decay_steps = 9 * warmup_steps
+    decay_steps = 19 * warmup_steps
     amp_dtype = "bfloat16"
     amp_enabled = True
 
@@ -85,9 +94,9 @@ if __name__ == "__main__":
 
     # Get datasets and loaders
     tokenizer = BPTokenizer()
-    train_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_train.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
-    val_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_val.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
-    test_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_test.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
+    train_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_train_std_norm.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
+    val_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_val_std_norm.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
+    test_dataset = DoublingTimeDataset(df_path=(data_dir / "iso_rib_temp_mod_test_std_norm.csv"), tokenizer=tokenizer, parallel_state=parallel_state)
     collator = SequenceRegressionCollator(tokenizer=tokenizer, max_pad_length=context_len, parallel_state=parallel_state)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=parallel_state.dp_size, rank=parallel_state.dp_rank, shuffle=True, drop_last=False)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=parallel_state.dp_size, rank=parallel_state.dp_rank, shuffle=False, drop_last=False)
@@ -116,20 +125,31 @@ if __name__ == "__main__":
         ## Trainer configuration
         trainer_cfg = SequenceRegressionTrainerConfig(
             log_every=log_every,
+            log_dir=log_dir,
             eval_every=eval_every,
             batches_per_step=batches_per_step,
-            learning_rate=learning_rate,
             warmup_steps=warmup_steps,
             decay_type=decay_type,
             decay_steps=decay_steps,
-            weight_decay=weight_decay,
             checkpoint_dir=ckpt_dir,
             save_every=save_every,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled
         )
         trainer = SequenceRegressionTrainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
-        trainer._init_optimizer()
+        param_groups = [
+            {
+                "params": model.backbone.parameters(),
+                "lr": backbone_learning_rate,
+                "weight_decay": backbone_weight_decay,
+            },
+            {
+                "params": list(model.temp_embed.parameters()) + list(model.output_head.parameters()),
+                "lr": head_learning_rate,
+                "weight_decay": head_weight_decay,
+            },
+        ]
+        trainer._init_optimizer(param_groups=param_groups)
     # Finetune from checkpoint
     elif finetune_from:
         finetune_from = Path(finetune_from).resolve()
@@ -154,20 +174,31 @@ if __name__ == "__main__":
         model.backbone.load_state_dict(backbone_state_dict, strict=True)
         trainer_cfg = SequenceRegressionTrainerConfig(
             log_every=log_every,
+            log_dir=log_dir,
             eval_every=eval_every,
             batches_per_step=batches_per_step,
-            learning_rate=learning_rate,
             warmup_steps=warmup_steps,
             decay_type=decay_type,
             decay_steps=decay_steps,
-            weight_decay=weight_decay,
             checkpoint_dir=ckpt_dir,
             save_every=save_every,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled
         )
         trainer = SequenceRegressionTrainer(config=trainer_cfg, model=model, device=device, parallel_state=parallel_state)
-        trainer._init_optimizer()
+        param_groups = [
+            {
+                "params": model.backbone.parameters(),
+                "lr": backbone_learning_rate,
+                "weight_decay": backbone_weight_decay,
+            },
+            {
+                "params": list(model.temp_embed.parameters()) + list(model.output_head.parameters()),
+                "lr": head_learning_rate,
+                "weight_decay": head_weight_decay,
+            },
+        ]
+        trainer._init_optimizer(param_groups=param_groups)
     # Otherwise, train from checkpoint
     else:
         ckpt_dir = ckpt_dir / resume_from

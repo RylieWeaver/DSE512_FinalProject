@@ -27,3 +27,15 @@ def resolve_device(device: Optional[Union[torch.device, str]] = None, parallel_s
             return torch.device("cuda")
     else:
         return torch.device("cpu")
+
+
+def to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(to_cpu(v) for v in obj)
+    return obj

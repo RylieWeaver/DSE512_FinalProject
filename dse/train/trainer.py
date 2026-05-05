@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
 from dse.model import TransformerConfig, MLMTransformer, SequenceRegressionTransformer
-from dse.distributed import ParallelState, is_rank0, rank0_print, rank0_write, reduce_scalar, unwrap_model, resolve_device, broadcast_tensor
+from dse.distributed import ParallelState, is_rank0, rank0_print, rank0_write, reduce_scalar, unwrap_model, resolve_device, to_cpu, broadcast_tensor
 from dse.data import move_to
 from dse.utils import Config
 from .utils import init_optimizer_and_scheduler
@@ -335,13 +335,13 @@ class MLMTrainer:
             save_dir.mkdir(parents=True, exist_ok=True)
             # Model
             model.cfg.save(save_dir / "model_config.json")
-            torch.save(model.state_dict(), save_dir / f"model.pt")
+            torch.save(to_cpu(model.state_dict()), save_dir / f"model.pt")
             # Trainer
             self.cfg.save(save_dir / "trainer_config.json")
             torch.save({"step": self.last_step, "best_val_loss": self.best_val_loss}, save_dir / "trainer.pt")
             # Optimizer / scheduler
-            torch.save(self.optimizer.state_dict(), save_dir / "optimizer.pt")
-            torch.save(self.scheduler.state_dict(), save_dir / "scheduler.pt")
+            torch.save(to_cpu(self.optimizer.state_dict()), save_dir / "optimizer.pt")
+            torch.save(to_cpu(self.scheduler.state_dict()), save_dir / "scheduler.pt")
 
     @staticmethod
     def load_checkpoint(dir: Union[Path, str], device: torch.device, parallel_state: ParallelState = None) -> "MLMTrainer":
@@ -434,7 +434,7 @@ class SequenceRegressionTrainer:
         self.last_epoch = 0
         self.best_val_loss = float("inf")    
 
-    def _init_optimizer(self):
+    def _init_optimizer(self, param_groups=None):
         self.optimizer, self.scheduler = init_optimizer_and_scheduler(
             model=self.model,
             learning_rate=self.cfg.learning_rate,
@@ -442,6 +442,7 @@ class SequenceRegressionTrainer:
             decay_steps=self.cfg.decay_steps,
             decay_type=self.cfg.decay_type,
             weight_decay=self.cfg.weight_decay,
+            param_groups=param_groups
         )
 
     def _init_cumulative_metrics(self, descriptors: list[str] | str):
@@ -590,7 +591,7 @@ class SequenceRegressionTrainer:
         loss, count = self._eval_epoch(loader)
         self._inc_metrics(loss, count, desc)
         self._reduce_metrics(desc)  # Reduce metrics over parallel processes
-        
+
         # Log and reset
         self._log_metrics(desc)
 
@@ -696,13 +697,13 @@ class SequenceRegressionTrainer:
             save_dir.mkdir(parents=True, exist_ok=True)
             # Model
             model.cfg.save(save_dir / "model_config.json")
-            torch.save(model.state_dict(), save_dir / f"model.pt")
+            torch.save(to_cpu(model.state_dict()), save_dir / f"model.pt")
             # Trainer
             self.cfg.save(save_dir / "trainer_config.json")
             torch.save({"epoch": self.last_epoch, "best_val_loss": self.best_val_loss}, save_dir / "trainer.pt")
             # Optimizer / scheduler
-            torch.save(self.optimizer.state_dict(), save_dir / "optimizer.pt")
-            torch.save(self.scheduler.state_dict(), save_dir / "scheduler.pt")
+            torch.save(to_cpu(self.optimizer.state_dict()), save_dir / "optimizer.pt")
+            torch.save(to_cpu(self.scheduler.state_dict()), save_dir / "scheduler.pt")
         if dist.is_initialized():
             dist.barrier()
 
