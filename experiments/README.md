@@ -11,6 +11,18 @@ Before submitting, check that the paths in each script point to the environment,
 
 ## Frontier Scaling Laws Experiment
 
+### Data
+
+The scaling-law experiments train on downloaded microbial reference FASTA files. Download them before submitting the sweep:
+
+```bash
+python ../dse/data/reference/download_reference.py \
+    --csv_dir ../dse/data/ribosomal \
+    --target_root /path/to/store/your/data
+```
+
+The `--target_root` value should match `DATA_DIR` in `submit_frontier_scaling_laws.sh`. The download script uses the NCBI `datasets` command-line tool, so make sure it is installed and on your `PATH` first.
+
 The scaling-law sweep is submitted with:
 
 ```bash
@@ -56,10 +68,36 @@ If changing the actual training behavior, edit these constants in `frontier_scal
 - `WARMUP_STEPS`
 - Module versions and proxy settings if Frontier's software stack changes.
 
+### Plots
+
+After the scaling-law jobs finish, create the plots from the per-run logs:
+
+```bash
+python plot_scaling_laws.py \
+    --log-root log \
+    --out-dir plots_results \
+    --series train_test
+```
+
+The plotting script expects logs in directories like `log/<run_name>/log.txt`, where the run directory names match the pattern written by the scaling-law scripts, such as `md128_ctx512_bs1_bps1_sp8_dp32`.
+
+Useful plotting args to change:
+
+- `--log-root`: directory containing the per-run log directories.
+- `--out-dir`: directory where the CSV and PNG files should be written.
+- `--series`: one of `train`, `eval`, `test`, or `train_test`.
+- `--min-step`: drop points before this step; defaults to `0`.
+- `--max-loss`: optionally filter out high-loss points.
+- `--ema-alpha`: smoothing factor for plotted curves; defaults to `0.9`, and `0` disables smoothing.
+
+For `--series train_test`, the script writes `train_test_scaling_points.csv` plus train/test loss and accuracy plots against log training tokens and log training FLOPs.
+
 
 ## Pretrain -> Finetune Experiment
 
 ### Pretrain
+
+The pretraining job uses the same downloaded microbial reference FASTA data as the scaling-law experiment. If it is not already present, run the download command from the scaling-law data section and make sure `DATA_DIR` in `pretraining.sh` points at the same target directory.
 
 Submit the single pretraining job with:
 
@@ -97,6 +135,8 @@ Change these training constants in `pretraining.sh` when adjusting the schedule:
 The script launches `train_mlm_distributed.py`. The shell variables above are passed through as CLI args such as `--data_dir`, `--ckpt_dir`, `--log_dir`, `--chunk_size`, `--context_len`, `--model_dim`, `--learning_rate`, `--end_step`, `--batch_size`, `--batches_per_step`, `--warmup_steps`, `--data_parallel_size`, and `--sequence_parallel_size`. If checkpoint resume is enabled, it also passes `--resume_from`.
 
 ### Finetune
+
+The finetuning data is already stored in the repository under `dse/data/ribosomal/`. The default `DATA_DIR` in `finetune.sh` points there, so no separate download step is needed for finetuning.
 
 Submit the finetuning job with:
 
