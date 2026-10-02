@@ -30,6 +30,9 @@ This needs only Python's standard library. It writes:
 - `experiments/baselines/results/summary.json`: split sizes, normalization and fitted coefficients.
 - `experiments/baselines/results/REPORT.md`: a short table and interpretation for team review.
 
+The evaluator preserves an existing `REPORT.md` so team edits are not lost.
+Pass `--overwrite-report` only when you intend to replace it with generated text.
+
 The evaluator checks required columns, finite values, unique assembly IDs,
 disjoint splits, and agreement between raw and standardized CSVs. The checked-in
 data currently contains 301 train, 25 validation, and 74 test assemblies.

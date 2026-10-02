@@ -1,6 +1,6 @@
 # Doubling-time baseline results
 
-The fixed assembly-level split has 301 train, 25 validation, and 74 test examples. Mean and temperature regression are fitted on train only. Lower MSE is better.
+The fixed assembly-level split has 301 train, 25 validation, and 74 test examples. Mean and temperature regression are fitted on train only.
 
 MSE uses the training-standardized `log_dob_h` target, matching the sequence regression trainer. Each assembly is scored once.
 
@@ -23,6 +23,7 @@ gRodon coverage (valid predictions): train 285/301, val 25/25, test 72/74.
 The `grodon_matched` cohort compares all methods on those same assemblies. Review `summary.json` and the gRodon status CSV for failures.
 On validation, gRodon MSE was 0.5043 versus 0.6861 for temperature regression. On the covered test assemblies, the scores were 0.7669 and 0.8143, respectively. gRodon uses additional genome-wide annotation, so this comparison describes predictive performance with different input information.
 gRodon predictions above five hours: train 95, val 4, test 23. Its codon-usage signal can saturate for slow growers, so errors on those rows need careful interpretation.
-Question for the team: Are the project's `log_dob_h` labels the natural log of doubling time in hours, and do they represent a quantity comparable to gRodon's minimum doubling time estimate?
+Clarification:
+Is the `log_dob_h` labels natural-log hours and represent a doubling-time quantity comparable to gRodon's minimum doubling time estimate.
 
-For the final paper comparison, use model predictions from the validation-selected checkpoint, with each unique assembly counted once. The Frontier distributed sampler can repeat validation and test rows.
+For the paper comparison, I recommend we use model predictions from the validation-selected checkpoint, with each unique assembly counted once. The Frontier distributed sampler can repeat validation and test rows.

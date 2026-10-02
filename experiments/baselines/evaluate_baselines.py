@@ -285,6 +285,8 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=script_dir.parent.parent / "dse/data/ribosomal")
     parser.add_argument("--out-dir", type=Path, default=script_dir / "results")
     parser.add_argument("--grodon-predictions", type=Path, help="CSV produced by run_grodon.R")
+    parser.add_argument("--overwrite-report", action="store_true",
+                        help="Replace an existing REPORT.md with generated text")
     args = parser.parse_args()
 
     splits, stats = load_data(args.data_dir)
@@ -343,12 +345,16 @@ def main() -> None:
     with (args.out_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, allow_nan=False)
         handle.write("\n")
-    write_report(args.out_dir / "REPORT.md", metrics, summary["split_sizes"], grodon_info)
+    report_path = args.out_dir / "REPORT.md"
+    wrote_report = args.overwrite_report or not report_path.exists()
+    if wrote_report:
+        write_report(report_path, metrics, summary["split_sizes"], grodon_info)
     for row in metrics:
         if row["split"] in ("val", "test"):
             print(f"{row['cohort']:14} {row['split']:5} {row['method']:18} "
                   f"n={row['n']:3} MSE={row['mse_normalized']:.4f}")
-    print(f"Wrote metrics.csv, predictions.csv, summary.json, and REPORT.md to {args.out_dir}")
+    print(f"Wrote metrics.csv, predictions.csv, and summary.json to {args.out_dir}")
+    print(f"{'Wrote' if wrote_report else 'Preserved'} {report_path}")
 
 
 if __name__ == "__main__":
