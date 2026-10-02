@@ -1,0 +1,57 @@
+{
+  "data_dir": "dse/data/ribosomal",
+  "grodon_predictions": "experiments/baselines/results/grodon_predictions.csv",
+  "target": "log_dob_h",
+  "primary_metric": "mse_normalized",
+  "split_sizes": {
+    "train": 301,
+    "val": 25,
+    "test": 74
+  },
+  "train_mean_normalized": -3.466565351495181e-17,
+  "temperature_linear": {
+    "intercept_normalized": -2.883691274725059e-17,
+    "slope_normalized": -0.32066332487860966
+  },
+  "normalization": {
+    "log_dob_h": {
+      "mean": 1.174491703292253,
+      "std": 1.4826583372452964
+    },
+    "growth_tmp": {
+      "mean": 40.819933554817275,
+      "std": 18.02317400817358
+    }
+  },
+  "grodon": {
+    "status_counts": {
+      "failed": 18,
+      "ok": 382,
+      "not_in_file": 0
+    },
+    "coverage": {
+      "train": {
+        "available": 285,
+        "total": 301
+      },
+      "val": {
+        "available": 25,
+        "total": 25
+      },
+      "test": {
+        "available": 72,
+        "total": 74
+      }
+    },
+    "predicted_over_five_hours": {
+      "train": 95,
+      "val": 4,
+      "test": 23
+    },
+    "saturation_warnings": {
+      "train": 95,
+      "val": 4,
+      "test": 23
+    }
+  }
+}
