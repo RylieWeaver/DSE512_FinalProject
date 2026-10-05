@@ -155,10 +155,10 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, parallel_state):
+    def __init__(self, dim, parallel_state, mlp_ratio=4.0):
         super().__init__()
         self.dim = dim
-        self.hidden_dim = 4 * dim
+        self.hidden_dim = int(mlp_ratio * dim)
         self.fc1 = nn.Linear(dim, self.hidden_dim)
         self.fc2 = nn.Linear(self.hidden_dim, dim)
 
@@ -170,7 +170,7 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, parallel_state, attn_dropout=0.0, resid_dropout=0.0, use_flash_attn=False):
+    def __init__(self, dim, num_heads, parallel_state, attn_dropout=0.0, resid_dropout=0.0, use_flash_attn=False, mlp_ratio=4.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = Attention(
@@ -181,7 +181,7 @@ class TransformerBlock(nn.Module):
             use_flash_attn=use_flash_attn,
         )
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, parallel_state)
+        self.mlp = MLP(dim, parallel_state, mlp_ratio=mlp_ratio)
         self.resid_dropout = nn.Dropout(resid_dropout)
 
     def forward(self, x, rope_cos, rope_sin):       # each [B, S_sub, D]
@@ -226,6 +226,7 @@ class TransformerConfig(Config):
         attn_dropout: float = 0.0,
         resid_dropout: float = 0.0,
         head_dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -239,12 +240,13 @@ class TransformerConfig(Config):
         self.attn_dropout = attn_dropout
         self.resid_dropout = resid_dropout
         self.head_dropout = head_dropout
+        self.mlp_ratio = mlp_ratio
         for key, value in kwargs.items():
             setattr(self, key, value)
 
 
 class TransformerBackbone(nn.Module):
-    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None, use_token_embedding: bool = True):
         super().__init__()
         # Read
         self.cfg = cfg
@@ -261,7 +263,7 @@ class TransformerBackbone(nn.Module):
         self.sp_rank = parallel_state.sp_rank
 
         # Modules
-        self.token_emb = TokenEmbedding(vocab_size, dim, init_std=cfg.init_std)
+        self.token_emb = TokenEmbedding(vocab_size, dim, init_std=cfg.init_std) if use_token_embedding else None
         self.embed_dropout = nn.Dropout(cfg.embed_dropout)
         self._register_rope(max_seq_len=max_seq_len, base=10000.0)
         self.blocks = nn.ModuleList(
@@ -273,6 +275,7 @@ class TransformerBackbone(nn.Module):
                     attn_dropout=cfg.attn_dropout,
                     resid_dropout=cfg.resid_dropout,
                     use_flash_attn=self.use_flash_attn,
+                    mlp_ratio=cfg.mlp_ratio,
                 )
                 for _ in range(num_layers)
             ]
@@ -286,18 +289,25 @@ class TransformerBackbone(nn.Module):
         """
         max_seq_len = max_seq_len if max_seq_len is not None else self.cfg.max_seq_len
         head_dim = self.cfg.dim // self.cfg.num_heads
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            # Embedding-input backbones have no parameters until blocks are built.
+            device = torch.device("cpu")
         rope_cos, rope_sin = compute_rope(
             seq_len=max_seq_len,
             dim=head_dim,
-            device=next(self.parameters()).device,
+            device=device,
             base=base,
         )
         self.register_buffer("rope_cos", rope_cos, persistent=False)    # [S, D/2]
         self.register_buffer("rope_sin", rope_sin, persistent=False)    # [S, D/2]
 
-    def forward(self, input_ids):                                       # [B, S_sub]
+    def forward(self, input_ids=None, input_embeddings=None):
         # Setup
-        B, S = input_ids.shape
+        if (input_ids is None) == (input_embeddings is None):
+            raise ValueError("Provide exactly one of input_ids or input_embeddings")
+        B, S = input_ids.shape if input_ids is not None else input_embeddings.shape[:2]
 
         # Get sp-aware idx
         if self.sp_size > 1:
@@ -309,12 +319,22 @@ class TransformerBackbone(nn.Module):
             seq_start_idx, seq_end_idx = 0, S
 
         # Split items for this sp rank's sequence chunk
-        input_ids = input_ids[:, seq_start_idx:seq_end_idx]             # [B, S_sub]
+        if input_ids is not None:
+            input_ids = input_ids[:, seq_start_idx:seq_end_idx]
+            x = self.token_emb.embed(input_ids)
+        else:
+            input_embeddings = input_embeddings[:, seq_start_idx:seq_end_idx]
+            if input_embeddings.size(-1) != self.cfg.dim:
+                raise ValueError(
+                    f"Expected embedding dimension {self.cfg.dim}, got "
+                    f"{input_embeddings.size(-1)}"
+                )
+            x = input_embeddings
         rope_cos = self.rope_cos[seq_start_idx:seq_end_idx, :]          # [S_sub, D/2]
         rope_sin = self.rope_sin[seq_start_idx:seq_end_idx, :]          # [S_sub, D/2]
 
         # Transformer blocks
-        x = self.embed_dropout(self.token_emb.embed(input_ids))         # [B, S_sub, D]
+        x = self.embed_dropout(x)                                       # [B, S_sub, D]
         for block in self.blocks:
             x = block(x, rope_cos, rope_sin)
 
@@ -454,4 +474,49 @@ class SequenceRegressionTransformer(Transformer):
         ## grads necessarily have to sync across all sp - otherwise not!
         x = torch.cat((x, t), dim=-1)                               # [B, 2*D]
         preds = self.output_head(x)                                 # [B, output_dim]
+        return preds, labels
+
+
+class EmbeddingSequenceRegressionTransformer(nn.Module):
+    """Standard RoPE transformer over precomputed continuous embeddings."""
+
+    def __init__(self, cfg: TransformerConfig, parallel_state: Optional[ParallelState] = None):
+        super().__init__()
+        self.cfg = cfg
+        input_dim = cfg.input_dim
+        output_dim = cfg.output_dim if hasattr(cfg, "output_dim") else 1
+        self.input_projection = nn.Linear(input_dim, cfg.dim)
+        self.backbone = TransformerBackbone(
+            cfg,
+            parallel_state=parallel_state,
+            use_token_embedding=False,
+        )
+        self.temp_embed = nn.Sequential(
+            nn.Linear(1, cfg.dim),
+            nn.SiLU(),
+            nn.Linear(cfg.dim, cfg.dim),
+            nn.LayerNorm(cfg.dim),
+        )
+        self.head_dropout = nn.Dropout(cfg.head_dropout)
+        self.output_head = nn.Sequential(
+            nn.Linear(2 * cfg.dim, 2 * cfg.dim),
+            nn.SiLU(),
+            nn.Linear(2 * cfg.dim, output_dim),
+        )
+
+    def forward(self, batch, labels=None):
+        embeddings = batch["chunk_embeddings"]
+        chunk_mask = batch["chunk_mask"]
+        temperatures = batch["temperatures"]
+        if not chunk_mask.all():
+            raise ValueError(
+                "EmbeddingSequenceRegressionTransformer currently requires an "
+                "unpadded batch; use --batch_size 1"
+            )
+
+        x = self.input_projection(embeddings)
+        x = self.backbone(input_embeddings=x)
+        x = self.head_dropout(x).mean(dim=1)
+        temperature = self.temp_embed(temperatures.reshape(-1, 1))
+        preds = self.output_head(torch.cat((x, temperature), dim=-1))
         return preds, labels

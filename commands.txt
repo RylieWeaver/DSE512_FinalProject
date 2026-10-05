@@ -1,0 +1,18 @@
+# Run these commands from the DSE512_FinalProject repository root.
+
+# Install the NCBI Datasets CLI locally.
+mkdir -p .tools/bin
+curl -L -o .tools/bin/datasets https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets
+chmod +x .tools/bin/datasets
+export PATH="$(pwd)/.tools/bin:$PATH"
+
+# Install the Python packages required by the download script if needed.
+python -m pip install pandas tqdm
+
+# Download and extract the train, validation, and test reference genomes.
+python dse/data/reference/download_reference.py \
+    --csv_dir dse/data/ribosomal \
+    --target_root dse/data/reference/Microbial
+
+# Optional: confirm the downloaded FASTA files.
+find dse/data/reference/Microbial -type f -name '*.fa' | sort

@@ -1,0 +1,76 @@
+set -e
+
+export PATH="/mnt/DGX01/Personal/r9w/Environments/bin:$PATH"
+export PYTHONPATH="/home/r9w/Training/DSE512_FinalProject:${PYTHONPATH:-}"
+
+cd /home/r9w/Training/DSE512_FinalProject
+
+# Download and extract the train, validation, and test reference genomes.
+python3 dse/data/reference/download_reference.py \
+    --csv_dir dse/data/ribosomal \
+    --target_root /mnt/DGX01/Personal/r9w/Datasets
+
+# Train autoencoder
+nohup python3 autoencoder/train_autoencoder.py \
+    --data_dir /mnt/DGX01/Personal/r9w/Datasets \
+    --ckpt_dir /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/residual_bn_autoencoder \
+    --log_dir /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/residual_bn_autoencoder/log \
+    --chunk_size 2048 \
+    --learning_rate 3e-5 \
+    --warmup_steps 1000 \
+    --batch_size 32 \
+    --batches_per_step 1 \
+    --latent_dim 8192 \
+    --expansion_factor 2.0 \
+    --num_layers 2 \
+    --save_every 10000 \
+    --no_save_best \
+    --steps 10000 \
+    --amp \
+    > /dev/null 2>&1 < /dev/null &
+
+# Create genome embeddings from the downloaded FASTAs and trained autoencoder.
+python3 genome_regression/build_embeddings.py \
+    --reference_dir /mnt/DGX01/Personal/r9w/Datasets \
+    --metadata_dir dse/data/ribosomal \
+    --autoencoder_checkpoint /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/residual_bn_autoencoder/step_10000 \
+    --output_dir /mnt/DGX01/Personal/r9w/Datasets/Microbial/autoencoder_embeddings \
+    --chunk_size 2048 \
+    --overwrite \
+    --amp
+
+# Train genome regression from the generated embeddings.
+mkdir -p genome_regression/log
+nohup python3 genome_regression/train_genome_regression.py \
+    --data_dir /mnt/DGX01/Personal/r9w/Datasets/Microbial/autoencoder_embeddings \
+    --dim 768 \
+    --num_filters 64 \
+    --num_heads 8 \
+    --num_transformer_layers 6 \
+    --mlp_ratio 4.0 \
+    --dropout 0.0 \
+    --weight_decay 0.0 \
+    --batches_per_step 8 \
+    --epochs 1000 \
+    --amp \
+    > /dev/null 2>&1 < /dev/null &
+
+
+# Run separately from the K-filter model if both commands use the same GPU.
+nohup python3 genome_regression/train_embedding_regression.py \
+    --data_dir /mnt/DGX01/Personal/r9w/Datasets/Microbial/autoencoder_embeddings \
+    --ckpt_dir /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/embedding_transformer \
+    --log_dir /mnt/DGX01/Personal/r9w/Checkpoints/Microbial/embedding_transformer/log \
+    --dim 768 \
+    --num_heads 8 \
+    --num_transformer_layers 6 \
+    --mlp_ratio 4.0 \
+    --dropout 0.0 \
+    --learning_rate 3e-5 \
+    --weight_decay 3e-4 \
+    --batches_per_step 9 \
+    --epochs 1000 \
+    --amp \
+    > /dev/null 2>&1 < /dev/null &
+
+# Took 175 epochs but then randomly converged to basically memorize

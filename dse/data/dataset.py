@@ -205,6 +205,29 @@ class MLMCollator:
         return input_ids, labels
 
 
+class AutoEncoderCollator:
+    """Pad DNA chunks and use the original tokens as reconstruction labels."""
+
+    def __init__(self, tokenizer=None, min_pad_length=2, max_pad_length=None):
+        self.tokenizer = tokenizer if tokenizer is not None else BPTokenizer()
+        self.min_pad_length = min_pad_length
+        self.max_pad_length = max_pad_length
+
+    def __call__(self, batch):
+        pad_token_id = self.tokenizer.tok2id[self.tokenizer.PAD]
+        max_length = max(item["token_ids"].size(0) for item in batch)
+        pad_length = max(max_length, self.min_pad_length)
+        if self.max_pad_length is not None:
+            pad_length = min(pad_length, self.max_pad_length)
+
+        sequences = [item["token_ids"][:pad_length] for item in batch]
+        input_ids, _ = pad(sequences, pad_val=pad_token_id, pad_length=pad_length)
+        labels = torch.full_like(input_ids, -100)
+        for row, sequence in enumerate(sequences):
+            labels[row, :sequence.size(0)] = sequence
+        return input_ids, labels
+
+
 class FASTADataset(IterableDataset):
     def __init__(
         self, 

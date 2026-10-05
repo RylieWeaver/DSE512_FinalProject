@@ -11,7 +11,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # DSE 512
-from dse.model import TransformerConfig, MLMTransformer, SequenceRegressionTransformer
+from dse.model import (
+    AutoEncoderConfig,
+    DNAAutoEncoder,
+    GenomeRegressionConfig,
+    GenomeChunkRegressionModel,
+    TransformerConfig,
+    MLMTransformer,
+    EmbeddingSequenceRegressionTransformer,
+    SequenceRegressionTransformer,
+)
 from dse.distributed import ParallelState, is_rank0, rank0_print, rank0_write, reduce_scalar, unwrap_model, resolve_device, to_cpu, broadcast_tensor
 from dse.data import move_to
 from dse.utils import Config
@@ -34,10 +43,13 @@ class MLMTrainerConfig(Config):
             log_dir: Optional[Union[Path, str]] = None,
             checkpoint_dir: Optional[Union[Path, str]] = None,
             save_every: Optional[int] = None,
+            save_best: bool = True,
             amp_dtype: Optional[str] = "bfloat16",
             amp_enabled: bool = False,
             **kwargs
     ):
+        if batches_per_step < 1:
+            raise ValueError("batches_per_step must be positive")
         # Read args
         self.log_every = log_every
         self.eval_every = eval_every
@@ -54,6 +66,7 @@ class MLMTrainerConfig(Config):
         if self.checkpoint_dir and is_rank0():
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.save_every = save_every
+        self.save_best = save_best
         self.amp_dtype = amp_dtype
         self.amp_enabled = amp_enabled
 
@@ -311,7 +324,7 @@ class MLMTrainer:
                 val_num = self.cumulative_metrics[self.descriptors[2]]["loss"]
                 val_den = self.cumulative_metrics[self.descriptors[2]]["count"]
                 val_loss = val_num / val_den if val_den > 0 else float("inf")
-                if val_loss < self.best_val_loss:  # Check if best val loss
+                if self.cfg.save_best and val_loss < self.best_val_loss:  # Check if best val loss
                     self.best_val_loss = val_loss
                     self.save_checkpoint("best")
                 self.model.train()  # Switch back to train
@@ -372,6 +385,63 @@ class MLMTrainer:
         return trainer
 
 
+class AutoEncoderTrainerConfig(MLMTrainerConfig):
+    """The autoencoder uses the same step-based optimization settings as MLM."""
+
+    @staticmethod
+    def load(path: Union[Path, str]) -> "AutoEncoderTrainerConfig":
+        path = Path(path)
+        with path.open("r") as f:
+            cfg = json.load(f)
+        return AutoEncoderTrainerConfig(**cfg)
+
+
+class AutoEncoderTrainer(MLMTrainer):
+    """One-hot MSE reconstruction trainer for ``DNAAutoEncoder``."""
+
+    def __init__(self, config, model, device=None, parallel_state=None):
+        parallel_state = parallel_state if parallel_state else ParallelState()
+        if parallel_state.sp_size != 1:
+            raise ValueError("AutoEncoderTrainer does not support sequence parallelism yet")
+        super().__init__(config, model, device=device, parallel_state=parallel_state)
+
+    def _compute_metrics(self, logits, labels):
+        """Raw one-hot MSE, averaged over vocabulary channels per valid token."""
+        mask = labels != -100
+        safe_labels = labels.masked_fill(~mask, 0)
+        targets = torch.nn.functional.one_hot(
+            safe_labels, num_classes=logits.size(-1)
+        ).to(dtype=logits.dtype)
+        per_token_mse = (logits - targets).square().mean(dim=-1)
+        loss = per_token_mse[mask].sum()
+        correct, count = self._accuracy_counter(logits, labels)
+        return loss, correct, count
+
+    @staticmethod
+    def load_checkpoint(dir, device, parallel_state=None) -> "AutoEncoderTrainer":
+        dir = Path(dir)
+        parallel_state = parallel_state if parallel_state else ParallelState()
+
+        with (dir / "model_config.json").open("r") as f:
+            model_dict = json.load(f)
+        if model_dict.get("architecture_version") != 14:
+            raise ValueError(
+                "This checkpoint uses an older autoencoder architecture. "
+                "Retrain with the dense, no-pooling single-vector autoencoder."
+            )
+        model_cfg = AutoEncoderConfig(**model_dict)
+        model = DNAAutoEncoder(model_cfg).to(device)
+        model.load_state_dict(torch.load(dir / "model.pt", weights_only=True, map_location=device))
+
+        trainer_cfg = AutoEncoderTrainerConfig.load(dir / "trainer_config.json")
+        trainer = AutoEncoderTrainer(trainer_cfg, model, device=device, parallel_state=parallel_state)
+        trainer._load_state_dict(dir / "trainer.pt")
+        trainer._init_optimizer()
+        trainer.optimizer.load_state_dict(torch.load(dir / "optimizer.pt", map_location=device))
+        trainer.scheduler.load_state_dict(torch.load(dir / "scheduler.pt", map_location=device))
+        return trainer
+
+
 class SequenceRegressionTrainerConfig(Config):
     def __init__(
             self,
@@ -390,6 +460,8 @@ class SequenceRegressionTrainerConfig(Config):
             amp_enabled: bool = False,
             **kwargs
     ):
+        if batches_per_step < 1:
+            raise ValueError("batches_per_step must be positive")
         # Read args
         self.log_every = log_every
         self.eval_every = eval_every
@@ -623,8 +695,14 @@ class SequenceRegressionTrainer:
                 # Loss
                 loss, count = self._compute_metrics(preds, labels)
             # Backward (properly scale the loss for grad calculation to account for parallelism and accumulation)
-            grad_loss = self.true_local_loss(loss, count) / self.cfg.batches_per_step
-            if ((batch_idx + 1) % self.cfg.batches_per_step != 0) and isinstance(self.model, DDP):
+            group_start = (batch_idx // self.cfg.batches_per_step) * self.cfg.batches_per_step
+            group_size = min(self.cfg.batches_per_step, len(self.train_loader) - group_start)
+            is_step_boundary = (
+                (batch_idx + 1) % self.cfg.batches_per_step == 0
+                or batch_idx == len(self.train_loader) - 1
+            )
+            grad_loss = self.true_local_loss(loss, count) / group_size
+            if not is_step_boundary and isinstance(self.model, DDP):
                 with self.model.no_sync():
                     grad_loss.backward()
             else:
@@ -633,7 +711,7 @@ class SequenceRegressionTrainer:
             total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
             total_count += count.item() if isinstance(count, torch.Tensor) else count
             # Optimizer step
-            if ((batch_idx + 1) % self.cfg.batches_per_step == 0) or (batch_idx == len(self.train_loader) - 1):
+            if is_step_boundary:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -733,4 +811,63 @@ class SequenceRegressionTrainer:
         trainer.optimizer.load_state_dict(torch.load(dir / "optimizer.pt", map_location=device))
         scheduler_path = dir / "scheduler.pt"
         trainer.scheduler.load_state_dict(torch.load(scheduler_path, map_location=device))
+        return trainer
+
+
+class GenomeRegressionTrainer(SequenceRegressionTrainer):
+    """MSE regression trainer for precomputed genome chunk embeddings."""
+
+    def __init__(self, config, model, device=None, parallel_state=None):
+        parallel_state = parallel_state if parallel_state else ParallelState()
+        if parallel_state.sp_size != 1:
+            raise ValueError("GenomeRegressionTrainer does not support sequence parallelism yet")
+        super().__init__(config, model, device=device, parallel_state=parallel_state)
+
+    @staticmethod
+    def load_checkpoint(dir, device, parallel_state=None) -> "GenomeRegressionTrainer":
+        dir = Path(dir)
+        parallel_state = parallel_state if parallel_state else ParallelState()
+
+        with (dir / "model_config.json").open("r") as handle:
+            model_cfg = GenomeRegressionConfig(**json.load(handle))
+        model = GenomeChunkRegressionModel(model_cfg).to(device)
+        model.load_state_dict(torch.load(dir / "model.pt", weights_only=True, map_location=device))
+
+        trainer_cfg = SequenceRegressionTrainerConfig.load(dir / "trainer_config.json")
+        trainer = GenomeRegressionTrainer(
+            trainer_cfg, model, device=device, parallel_state=parallel_state
+        )
+        trainer._load_state_dict(dir / "trainer.pt")
+        trainer._init_optimizer()
+        trainer.optimizer.load_state_dict(torch.load(dir / "optimizer.pt", map_location=device))
+        trainer.scheduler.load_state_dict(torch.load(dir / "scheduler.pt", map_location=device))
+        return trainer
+
+
+class EmbeddingRegressionTrainer(SequenceRegressionTrainer):
+    """MSE trainer for the standard transformer over stored chunk embeddings."""
+
+    def __init__(self, config, model, device=None, parallel_state=None):
+        parallel_state = parallel_state if parallel_state else ParallelState()
+        if parallel_state.sp_size != 1:
+            raise ValueError("EmbeddingRegressionTrainer does not support sequence parallelism yet")
+        super().__init__(config, model, device=device, parallel_state=parallel_state)
+
+    @staticmethod
+    def load_checkpoint(dir, device, parallel_state=None) -> "EmbeddingRegressionTrainer":
+        dir = Path(dir)
+        parallel_state = parallel_state if parallel_state else ParallelState()
+        with (dir / "model_config.json").open("r") as handle:
+            model_cfg = TransformerConfig(**json.load(handle))
+        model = EmbeddingSequenceRegressionTransformer(model_cfg, parallel_state).to(device)
+        model.load_state_dict(torch.load(dir / "model.pt", weights_only=True, map_location=device))
+
+        trainer_cfg = SequenceRegressionTrainerConfig.load(dir / "trainer_config.json")
+        trainer = EmbeddingRegressionTrainer(
+            trainer_cfg, model, device=device, parallel_state=parallel_state
+        )
+        trainer._load_state_dict(dir / "trainer.pt")
+        trainer._init_optimizer()
+        trainer.optimizer.load_state_dict(torch.load(dir / "optimizer.pt", map_location=device))
+        trainer.scheduler.load_state_dict(torch.load(dir / "scheduler.pt", map_location=device))
         return trainer

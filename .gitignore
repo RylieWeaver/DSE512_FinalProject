@@ -4,3 +4,5 @@ log/
 
 dna.txt
 *.pyc
+
+genome_regression/data/
