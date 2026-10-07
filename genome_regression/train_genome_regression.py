@@ -54,7 +54,7 @@ def main():
     with (args.data_dir / "manifest.json").open("r") as handle:
         manifest = json.load(handle)
     datasets = {
-        split: GenomeEmbeddingDataset(args.data_dir, split)
+        split: GenomeEmbeddingDataset(args.data_dir, split, dtype=torch.float32)
         for split in ("train", "val", "test")
     }
     collator = GenomeEmbeddingCollator(max_chunks=args.max_chunks)

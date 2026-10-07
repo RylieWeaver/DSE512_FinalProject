@@ -1,6 +1,5 @@
 import argparse
 import csv
-import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -17,7 +16,7 @@ from dse.model import AutoEncoderConfig, DNAAutoEncoder
 SPLITS = ("train", "val", "test")
 
 
-def parse_args():
+def parse_args(argv=None):
     repo_dir = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(
         description="Create ragged genome chunk-embedding datasets with a trained autoencoder."
@@ -39,12 +38,12 @@ def parse_args():
         help="Overlap in bases; defaults to chunk_size // 8.",
     )
     parser.add_argument("--inference_batch_size", type=int, default=32)
-    parser.add_argument("--storage_dtype", choices=("float16", "float32"), default="float16")
+    parser.add_argument("--storage_dtype", choices=("float16", "float32", "float64"), default="float16")
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true", help="Fail instead of skipping missing FASTAs")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def read_rows(path, required_columns):
@@ -74,15 +73,8 @@ def load_autoencoder(checkpoint_dir, device):
     )
     model.load_state_dict(state_dict)
     model.eval()
+    model.requires_grad_(False)
     return model
-
-
-def file_sha256(path, block_size=1024 * 1024):
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while block := handle.read(block_size):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def chunk_starts(sequence_length, chunk_size, stride):
@@ -148,7 +140,7 @@ def encode_genome(fasta_path, model, tokenizer, chunk_size, stride, batch_size, 
                 enabled=amp,
             ):
                 embedding = model.encode(batch)  # [B, latent_dim]
-            embeddings.append(embedding.float().cpu())
+            embeddings.append(embedding.to(dtype=next(model.parameters()).dtype).cpu())
 
     return {
         "chunk_embeddings": torch.cat(embeddings, dim=0),
@@ -160,8 +152,7 @@ def encode_genome(fasta_path, model, tokenizer, chunk_size, stride, batch_size, 
     }
 
 
-def main():
-    args = parse_args()
+def run(args):
     if args.chunk_size < 1:
         raise ValueError("chunk_size must be positive")
     overlap = args.chunk_size // 8 if args.overlap is None else args.overlap
@@ -175,14 +166,16 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(args.device)
     model = load_autoencoder(args.autoencoder_checkpoint, device)
+    if model.cfg.dtype == "float64" and (args.amp or args.storage_dtype != "float64"):
+        raise ValueError("float64 checkpoints require --storage_dtype float64 and no --amp")
     if args.chunk_size != model.cfg.chunk_size:
         raise ValueError(
             f"Embedding chunk_size={args.chunk_size} does not match autoencoder "
             f"chunk_size={model.cfg.chunk_size}"
         )
-    autoencoder_sha256 = file_sha256(args.autoencoder_checkpoint.resolve() / "model.pt")
     tokenizer = BPTokenizer()
     storage_dtype = getattr(torch, args.storage_dtype)
+    label_dtype = getattr(torch, model.cfg.dtype)
 
     required_columns = {
         args.assembly_col,
@@ -205,11 +198,11 @@ def main():
         "format_version": 1,
         "storage": "ragged-per-genome-pt",
         "autoencoder_checkpoint": str(args.autoencoder_checkpoint.resolve()),
-        "autoencoder_model_sha256": autoencoder_sha256,
         "autoencoder_model_config": model.cfg.to_dict(),
         "input_dim": model.cfg.latent_dim,
         "latent_pooling": "none-single-vector-bottleneck",
         "storage_dtype": args.storage_dtype,
+        "compute_dtype": "bfloat16" if args.amp else model.cfg.dtype,
         "chunk_size": args.chunk_size,
         "overlap": overlap,
         "stride": stride,
@@ -259,7 +252,7 @@ def main():
                         "temperature": float(row[args.temperature_col]),
                         "labels": torch.tensor(
                             [float(row[column]) for column in args.target_cols],
-                            dtype=torch.float32,
+                            dtype=label_dtype,
                         ),
                         "chunk_size": args.chunk_size,
                         "overlap": overlap,
@@ -267,7 +260,6 @@ def main():
                         "autoencoder_checkpoint": str(
                             args.autoencoder_checkpoint.resolve()
                         ),
-                        "autoencoder_model_sha256": autoencoder_sha256,
                         "storage_dtype": args.storage_dtype,
                     }
                 )
@@ -279,7 +271,6 @@ def main():
                 "overlap": overlap,
                 "stride": stride,
                 "autoencoder_checkpoint": str(args.autoencoder_checkpoint.resolve()),
-                "autoencoder_model_sha256": autoencoder_sha256,
                 "storage_dtype": args.storage_dtype,
                 "organism_index": organism_to_index[row[args.organism_col]],
                 "temperature": float(row[args.temperature_col]),
@@ -295,9 +286,9 @@ def main():
                     model.cfg.latent_dim,
                 )
             expected_labels = torch.tensor(
-                [float(row[column]) for column in args.target_cols], dtype=torch.float32
+                [float(row[column]) for column in args.target_cols], dtype=label_dtype
             )
-            if not torch.equal(record["labels"].float(), expected_labels):
+            if not torch.equal(record["labels"], expected_labels):
                 mismatches["labels"] = (record["labels"].tolist(), expected_labels.tolist())
             if mismatches:
                 raise ValueError(
@@ -322,6 +313,10 @@ def main():
     with (args.output_dir / "manifest.json").open("w") as handle:
         json.dump(manifest, handle, indent=2)
     print(f"Wrote genome embedding dataset to {args.output_dir}")
+
+
+def main():
+    run(parse_args())
 
 
 if __name__ == "__main__":

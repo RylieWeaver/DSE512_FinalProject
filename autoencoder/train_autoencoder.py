@@ -10,7 +10,7 @@ from dse.train import AutoEncoderTrainer, AutoEncoderTrainerConfig
 from dse.utils import set_all_random_seeds
 
 
-def parse_args():
+def parse_args(argv=None):
     repo_dir = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description="Train a flattened single-vector DNA autoencoder.")
     parser.add_argument("--data_dir", type=Path, default=repo_dir / "dse/data/reference/Microbial")
@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--latent_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=None)
+    parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--expansion_factor", type=float, default=4.0, help="Hidden width as a multiple of latent_dim")
     parser.add_argument("--num_layers", type=int, default=1, help="One projection layer plus num_layers-1 residual blocks per side")
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -40,7 +42,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None, help="For example: cpu, cuda, or cuda:0")
     parser.add_argument("--amp", action="store_true", help="Enable bfloat16 autocast")
     parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def require_data(data_dir):
@@ -52,8 +54,9 @@ def require_data(data_dir):
         )
 
 
-def main():
-    args = parse_args()
+def run(args):
+    if args.dtype == "float64" and args.amp:
+        raise ValueError("float64 training must not use AMP")
     if args.batches_per_step < 1:
         raise ValueError("--batches_per_step must be positive")
     args.data_dir = args.data_dir.resolve()
@@ -90,6 +93,8 @@ def main():
             vocab_size=tokenizer.out_vocab_size,
             chunk_size=args.chunk_size,
             latent_dim=args.latent_dim,
+            hidden_dim=args.hidden_dim,
+            dtype=args.dtype,
             expansion_factor=args.expansion_factor,
             num_layers=args.num_layers,
             dropout=args.dropout,
@@ -116,6 +121,10 @@ def main():
         trainer._init_optimizer()
     else:
         trainer = AutoEncoderTrainer.load_checkpoint(args.resume_from.resolve(), device=device)
+        if trainer.model.cfg.dtype != args.dtype:
+            raise ValueError(f"Checkpoint dtype={trainer.model.cfg.dtype}, but --dtype={args.dtype}")
+        if args.hidden_dim is not None and trainer.model.hidden_dim != args.hidden_dim:
+            raise ValueError("Checkpoint hidden width differs from --hidden_dim")
         if trainer.model.cfg.chunk_size != args.chunk_size:
             raise ValueError(
                 f"Checkpoint chunk_size={trainer.model.cfg.chunk_size}, but "
@@ -127,6 +136,10 @@ def main():
     rank0_print(f"Single-vector latent shape: [batch, {trainer.model.cfg.latent_dim}]")
     rank0_print(f"Number of model parameters: {sum(p.numel() for p in trainer.model.parameters()):,}")
     trainer.train(steps=args.steps)
+
+
+def main():
+    run(parse_args())
 
 
 if __name__ == "__main__":

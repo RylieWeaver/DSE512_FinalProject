@@ -1,5 +1,7 @@
 from typing import Optional
 
+import torch
+
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -19,12 +21,18 @@ class AutoEncoderConfig(Config):
         dropout: float = 0.0,
         pad_token_id: int = 4,
         architecture_version: int = 14,
+        hidden_dim: Optional[int] = None,
+        dtype: str = "float32",
         **kwargs,
     ):
         if chunk_size < 1 or latent_dim < 1 or expansion_factor <= 0 or num_layers < 1:
             raise ValueError("chunk_size, latent_dim, expansion_factor, and num_layers must be positive")
         if architecture_version != 14:
             raise ValueError("Only residual MLP autoencoder architecture_version=14 is supported")
+        if hidden_dim is not None and hidden_dim < 1:
+            raise ValueError("hidden_dim must be positive")
+        if dtype not in ("float32", "float64"):
+            raise ValueError("dtype must be float32 or float64")
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
         self.latent_dim = latent_dim
@@ -33,6 +41,8 @@ class AutoEncoderConfig(Config):
         self.dropout = dropout
         self.pad_token_id = pad_token_id
         self.architecture_version = architecture_version
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
         for key, value in kwargs.items():
             setattr(self, key, value)
 
@@ -67,7 +77,7 @@ class DNAAutoEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.flat_dim = cfg.chunk_size * cfg.vocab_size
-        self.hidden_dim = max(1, round(cfg.expansion_factor * cfg.latent_dim))
+        self.hidden_dim = cfg.hidden_dim or max(1, round(cfg.expansion_factor * cfg.latent_dim))
 
         encoder_layers = [
             nn.Linear(self.flat_dim, self.hidden_dim),
@@ -93,6 +103,9 @@ class DNAAutoEncoder(nn.Module):
             nn.Linear(self.hidden_dim, self.flat_dim),
         ])
         self.decoder = nn.Sequential(*decoder_layers)
+        # Cast before loading checkpoints, so float64 weights are never rounded
+        # through float32. Old configs default to the original float32 behavior.
+        self.to(dtype=getattr(torch, cfg.dtype))
 
     def _pad_to_chunk_size(self, input_ids):
         original_length = input_ids.size(1)
@@ -111,7 +124,9 @@ class DNAAutoEncoder(nn.Module):
 
     def encode(self, input_ids):
         input_ids, _ = self._pad_to_chunk_size(input_ids)
-        one_hot = F.one_hot(input_ids, num_classes=self.cfg.vocab_size).float()
+        one_hot = F.one_hot(input_ids, num_classes=self.cfg.vocab_size).to(
+            dtype=next(self.parameters()).dtype
+        )
         return self.encoder(one_hot.flatten(start_dim=1))
 
     def decode(self, latent, output_length: Optional[int] = None):

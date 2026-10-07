@@ -1,57 +1,55 @@
-# Genome Chunk Regression
+# Genome Regression
 
-This pipeline freezes a trained DNA autoencoder, embeds overlapping chunks from
-every reference genome, and trains a hierarchical model to predict standardized
-`log_dob_h` from the resulting genome representation and standardized growth
-temperature.
+`run.sh` trains the autoencoders, builds their embedding caches, then runs:
 
-## 1. Build the embedding dataset
+| Run | Autoencoder bottleneck | Regressors | Regression learning rate | Regression precision |
+|---|---|---|---|---|
+| 1 | 10 (hidden width 256) | Width-2 MLP and transformer | `3e-3` | FP64 |
+| 2 | 8192 | Width-2 MLP and transformer | `3e-3` | FP64 |
+| 3 | 32 (hidden width 256) | Width-16 MLP and transformer | `3e-4` | FP64 |
+| 4 | Same 8192 cache | Original width-768, 6-layer, 8-head transformer | `3e-5` | FP32 with CUDA BF16 AMP |
 
-Download the reference FASTAs and train the autoencoder first. Then run:
+The small and medium autoencoders and their stored embeddings use FP64. Runs 2 and 4 share
+an FP32 large autoencoder (with BF16 AMP on CUDA) and an FP16 embedding cache.
+Run 2 converts those cached embeddings to FP64 for regression.
+All autoencoders keep a learning rate of `3e-5`.
 
-```bash
-bash genome_regression/build_embeddings.sh autoencoder/checkpoints/best
-```
+All runs use the existing training scripts. Defaults: seed 42, 10,000 autoencoder
+steps, and 200 regression epochs without early stopping. Train/validation/test
+are evaluated each epoch. Temperature and log doubling time use the original
+normalized CSVs; embeddings are not normalized.
 
-The default chunk overlap is `chunk_size // 8` (256 bases for a 2048-base
-chunk). Override it directly when invoking Python:
-
-```bash
-python3 genome_regression/build_embeddings.py \
-    --autoencoder_checkpoint autoencoder/checkpoints/best \
-    --chunk_size 2048 \
-    --overlap 256
-```
-
-Each FASTA record is chunked independently, so a chunk never crosses a record
-boundary. The record name, per-record integer ID, chunk start, chunk length, and
-within-record position are retained. The downloaded FASTA alone does not contain
-reliable record-type metadata, so "chromosome" here means a FASTA sequence
-record; filtering plasmids or scaffolds requires adding NCBI sequence-report
-metadata.
-
-The autoencoder produces one `[latent_dim]` vector for each input chunk. The
-builder stores that vector directly without any additional pooling. Data is
-stored as one ragged `.pt` record per assembly plus a `manifest.json`; it is
-padded only when a batch is collated.
-
-Existing records are reused only when the checkpoint, chunk size, overlap,
-stride, and latent dimension match. Use `--overwrite` after changing any of
-those settings.
-
-## 2. Train regression
+Run from the repository root:
 
 ```bash
-bash genome_regression/train_genome_regression.sh
+DEVICE=cuda:0 bash genome_regression/run.sh
 ```
 
-The model applies chromosome context, genome context, learned absolute chunk
-position, and a learned temperature projection. It then uses K learned filters
-to attention-pool all valid chunks into K unordered tokens and processes those
-tokens with ordinary transformer encoder layers. Padding logits are set to
-negative infinity before softmax.
+Edit settings at the top of `run.sh`, or set environment variables such as
+`RUN_DIR`, `EPOCHS`, and `AE_STEPS`. To run one model, copy its command from the script.
 
-The organism index is retained as structural metadata but does not select an
-embedding or any other organism-specific parameter. Each collated batch row is
-one genome, so chromosome and whole-genome aggregation are defined by the row's
-masks and chromosome IDs.
+To reuse trained autoencoders:
+
+```bash
+SMALL_AE_CHECKPOINT=/path/to/ae10/best \
+MEDIUM_AE_CHECKPOINT=/path/to/ae32/step_10000 \
+LARGE_AE_CHECKPOINT=/path/to/ae8192/step_10000 \
+bash genome_regression/run.sh
+```
+
+Alternatively, set `LARGE_EMBEDDINGS=/path/to/cache` to skip both large-autoencoder
+training and embedding generation.
+
+Outputs go under `RUN_DIR` (default
+`/mnt/DGX01/Personal/r9w/Checkpoints/Microbial/genome_regression_seed42`), in
+`scenario1/{mlp,transformer}`, `scenario2/{mlp,transformer}`,
+`scenario3/{mlp,transformer}`, and `scenario4`.
+Each model saves checkpoints, `history.csv`, and separate loss/R² PNG/PDF plots.
+Use a new `RUN_DIR` to keep earlier results.
+
+To regenerate plots:
+
+```bash
+python -m genome_regression.plot \
+  --history /path/to/model/history.csv --name ae10_mlp
+```

@@ -20,6 +20,7 @@ from dse.model import (
     MLMTransformer,
     EmbeddingSequenceRegressionTransformer,
     SequenceRegressionTransformer,
+    EmbeddingMLPRegressor,
 )
 from dse.distributed import ParallelState, is_rank0, rank0_print, rank0_write, reduce_scalar, unwrap_model, resolve_device, to_cpu, broadcast_tensor
 from dse.data import move_to
@@ -845,7 +846,7 @@ class GenomeRegressionTrainer(SequenceRegressionTrainer):
 
 
 class EmbeddingRegressionTrainer(SequenceRegressionTrainer):
-    """MSE trainer for the standard transformer over stored chunk embeddings."""
+    """MSE trainer for regression over stored chunk embeddings."""
 
     def __init__(self, config, model, device=None, parallel_state=None):
         parallel_state = parallel_state if parallel_state else ParallelState()
@@ -859,7 +860,12 @@ class EmbeddingRegressionTrainer(SequenceRegressionTrainer):
         parallel_state = parallel_state if parallel_state else ParallelState()
         with (dir / "model_config.json").open("r") as handle:
             model_cfg = TransformerConfig(**json.load(handle))
-        model = EmbeddingSequenceRegressionTransformer(model_cfg, parallel_state).to(device)
+        if getattr(model_cfg, "model_type", "transformer") == "mlp":
+            model = EmbeddingMLPRegressor(model_cfg).to(device)
+        else:
+            model = EmbeddingSequenceRegressionTransformer(model_cfg, parallel_state).to(
+                device=device, dtype=getattr(torch, getattr(model_cfg, "dtype", "float32"))
+            )
         model.load_state_dict(torch.load(dir / "model.pt", weights_only=True, map_location=device))
 
         trainer_cfg = SequenceRegressionTrainerConfig.load(dir / "trainer_config.json")

@@ -1,3 +1,4 @@
 from .transformer import TransformerConfig, TransformerBackbone, MLMTransformer, SequenceRegressionTransformer, EmbeddingSequenceRegressionTransformer
 from .autoencoder import AutoEncoderConfig, DNAAutoEncoder
 from .genome_regression import GenomeRegressionConfig, GenomeChunkRegressionModel
+from .embedding_regression import EmbeddingMLPRegressor

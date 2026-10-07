@@ -8,9 +8,10 @@ from torch.utils.data import Dataset
 class GenomeEmbeddingDataset(Dataset):
     """Ragged per-genome records created by the autoencoder inference pipeline."""
 
-    def __init__(self, data_dir, split):
+    def __init__(self, data_dir, split, dtype=torch.float64):
         self.data_dir = Path(data_dir)
         self.split = split
+        self.dtype = dtype
         manifest_path = self.data_dir / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"Missing genome embedding manifest: {manifest_path}")
@@ -47,14 +48,14 @@ class GenomeEmbeddingDataset(Dataset):
                     f"{num_chunks} chunk embeddings"
                 )
         return {
-            "chunk_embeddings": record["chunk_embeddings"].float(),
+            "chunk_embeddings": record["chunk_embeddings"].to(self.dtype),
             "chromosome_ids": record["chromosome_ids"].long(),
             "position_ids": record["position_ids"].long(),
             "chunk_starts": record["chunk_starts"].long(),
             "chunk_lengths": record["chunk_lengths"].long(),
             "organism_index": int(record["organism_index"]),
             "temperature": float(record["temperature"]),
-            "labels": record["labels"].float(),
+            "labels": record["labels"].to(self.dtype),
             "assembly_id": record["assembly_id"],
             "chromosome_names": record["chromosome_names"],
         }
@@ -76,7 +77,8 @@ class GenomeEmbeddingCollator:
                 "refusing to silently truncate a genome"
             )
 
-        embeddings = torch.zeros(batch_size, num_chunks, input_dim, dtype=torch.float32)
+        dtype = batch[0]["chunk_embeddings"].dtype
+        embeddings = torch.zeros(batch_size, num_chunks, input_dim, dtype=dtype)
         chromosome_ids = torch.full((batch_size, num_chunks), -1, dtype=torch.long)
         position_ids = torch.zeros(batch_size, num_chunks, dtype=torch.long)
         chunk_mask = torch.zeros(batch_size, num_chunks, dtype=torch.bool)
@@ -97,7 +99,7 @@ class GenomeEmbeddingCollator:
                 [item["organism_index"] for item in batch], dtype=torch.long
             ),
             "temperatures": torch.tensor(
-                [item["temperature"] for item in batch], dtype=torch.float32
+                [item["temperature"] for item in batch], dtype=dtype
             ),
         }
         labels = torch.stack([item["labels"] for item in batch])
