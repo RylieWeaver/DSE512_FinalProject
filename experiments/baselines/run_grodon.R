@@ -104,7 +104,7 @@ for (i in seq_len(nrow(input_rows))) {
     genes <- Biostrings::readDNAStringSet(cds_path)
     n_cds <- length(genes)
     if (n_cds == 0) stop("CDS FASTA is empty")
-    highly_expressed <- grepl("^(?!.*(methyl|hydroxy)).*0S ribosomal protein",
+    highly_expressed <- grepl("^(?!.*(methyl|hydroxy)).*\\b[35]0S ribosomal protein\\b",
                               names(genes), ignore.case = TRUE, perl = TRUE)
     n_ribosomal <- sum(highly_expressed)
     if (n_ribosomal == 0) stop("No annotated 30S/50S ribosomal proteins found")

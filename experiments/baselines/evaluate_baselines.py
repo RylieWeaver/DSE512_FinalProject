@@ -27,6 +27,7 @@ PREDICTION_FIELDS = (
 METRIC_FIELDS = (
     "cohort", "split", "method", "n", "mse_normalized",
     "rmse_normalized", "mae_normalized", "rmse_log_hours", "mae_log_hours",
+    "r2_log_hours",
 )
 
 
@@ -174,11 +175,15 @@ def metric_row(cohort: str, split: str, method: str, pairs: list[tuple[Example, 
     normalized_errors = [prediction - row.y for row, prediction in pairs]
     mse = fmean(error * error for error in normalized_errors)
     mae = fmean(abs(error) for error in normalized_errors)
+    observed_mean = fmean(row.y for row, _ in pairs)
+    observed_variance = sum((row.y - observed_mean) ** 2 for row, _ in pairs)
+    r2 = (1 - sum(error * error for error in normalized_errors) / observed_variance
+          if observed_variance > 0 else None)
     return {
         "cohort": cohort, "split": split, "method": method, "n": len(pairs),
         "mse_normalized": mse, "rmse_normalized": math.sqrt(mse),
         "mae_normalized": mae, "rmse_log_hours": math.sqrt(mse) * target_std,
-        "mae_log_hours": mae * target_std,
+        "mae_log_hours": mae * target_std, "r2_log_hours": r2,
     }
 
 
@@ -206,18 +211,22 @@ def write_report(path: Path, metrics: list[dict], split_sizes: dict[str, int], g
         f"{split_sizes['test']} test examples. Mean and temperature regression "
         "are fitted on train only. Lower MSE is better.",
         "",
-        "MSE uses the training-standardized `log_dob_h` target, matching the "
-        "sequence regression trainer. Each assembly is scored once.",
+        "MSE and standardized RMSE use the training-standardized `log_dob_h` "
+        "target, matching the sequence regression trainer. RMSE in log hours "
+        "equals standardized RMSE times the training target standard deviation. "
+        "R² is computed against the observed mean of each scored cohort and split. "
+        "Each assembly is scored once.",
         "",
-        "| Cohort | Split | Method | N | MSE | RMSE (log hours) |",
-        "| --- | --- | --- | ---: | ---: | ---: |",
+        "| Cohort | Split | Method | N | MSE (std. log h) | RMSE (std. log h) | RMSE (log h) | R² |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in metrics:
         if row["split"] in ("val", "test"):
             lines.append(
                 f"| {row['cohort']} | {row['split']} | {row['method']} | "
                 f"{row['n']} | {row['mse_normalized']:.4f} | "
-                f"{row['rmse_log_hours']:.4f} |"
+                f"{row['rmse_normalized']:.4f} | {row['rmse_log_hours']:.4f} | "
+                f"{row['r2_log_hours']:.4f} |"
             )
     lines += [""]
     lines += [

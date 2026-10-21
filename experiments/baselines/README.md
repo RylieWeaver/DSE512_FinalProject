@@ -12,8 +12,11 @@ This folder evaluates three baselines against the fixed assembly-level splits in
 The primary score is mean squared error (MSE) of `log_dob_h` after applying the
 training-set standardization in `normalization_stats_std_norm.json`. This is the
 same target scale and loss function used by the sequence regression trainer. The
-CSV also reports RMSE and MAE in standardized and unstandardized log-hour units.
-Lower is better. Each assembly is counted once.
+CSV also reports RMSE and MAE in standardized and unstandardized log-hour units,
+plus R² for each scored cohort and split. MSE and RMSE are lower-is-better;
+R² is higher-is-better. Each assembly is counted once.
+R² can be negative when a method is worse than predicting the scored cohort's
+observed mean.
 
 ## 1. Run the two baselines available from the repository
 
@@ -47,6 +50,10 @@ assemblies:
 ```bash
 python experiments/baselines/download_cds.py --limit 3
 ```
+
+`--limit 3` selects the first three assembly IDs in train/validation/test order,
+not three per split or three copies of a genome. All three pilot IDs are in
+train; one currently lacks annotated CDS, so the pilot yields two FASTA files.
 
 After reviewing `experiments/baselines/cds/download_manifest.csv`, download the
 rest with:
@@ -98,6 +105,18 @@ gRodon's temperature option calls for *optimal growth temperature*. Use
 `growth_tmp` has that meaning. For incomplete genomes, consider a separately
 named run with `--mode partial` after checking assembly quality. Do not mix
 settings in one output CSV.
+
+### Training on this project's split
+
+The published gRodon model used here is already fitted to external data;
+`training_set=madin` does not mean the project's train split. A separate
+train-only comparison appears feasible: extract gRodon's codon-usage features
+for the 285 train assemblies with annotated CDS, fit a new regression to their
+`log_dob_h` labels, and evaluate it on the 25 validation and 72 test assemblies
+with CDS. This needs a separate implementation and result name because gRodon's
+`predictGrowth()` does not accept a project-specific `training_set` value.
+The team should first confirm that the labels describe a comparable doubling
+time target. Keep the published gRodon result as its own baseline.
 
 gRodon returns predicted minimal doubling time (`d`) in hours. The evaluator
 uses `log(d)` and then applies the project's **training** mean and standard
